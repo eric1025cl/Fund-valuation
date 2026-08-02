@@ -35,10 +35,19 @@ class AkshareProvider:
             growth = _parse_float(row.get("交易日-估算数据-估算增长率"))
             if nav is None or growth is None:
                 continue
+            estimate_time = _extract_datetime_text(
+                row,
+                ("估算时间", "更新时间", "更新日期", "时间", "date", "datetime", "update_time"),
+            )
+            trade_date = _extract_date_text(
+                row,
+                ("估算日期", "交易日期", "净值日期", "日期", "date", "trade_date"),
+            ) or _date_key(estimate_time)
             return OfficialEstimate(
                 nav=nav,
                 growth_pct=growth,
-                estimate_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                estimate_time=estimate_time,
+                trade_date=trade_date,
             )
         return None
 
@@ -205,6 +214,14 @@ class AkshareProvider:
         dates = self._cached("trade_dates", self._fetch_trade_dates, timedelta(hours=12))
         return date_key in dates
 
+    def latest_trading_day(self, current, include_current: bool = True) -> str | None:
+        date_key = str(current)[:10]
+        dates = self._cached("trade_dates", self._fetch_trade_dates, timedelta(hours=12))
+        if not dates:
+            return None
+        candidates = [value for value in dates if value <= date_key] if include_current else [value for value in dates if value < date_key]
+        return max(candidates) if candidates else None
+
     def _fetch_fund_names(self):
         return self._ak().fund_name_em()
 
@@ -258,6 +275,70 @@ def _first_present(row, names: tuple[str, ...]):
     return None
 
 
+def _extract_datetime_text(row, preferred_names: tuple[str, ...]) -> str | None:
+    for value in _candidate_values(row, preferred_names):
+        normalized = _normalize_datetime_text(value)
+        if normalized:
+            return normalized
+    return None
+
+
+def _extract_date_text(row, preferred_names: tuple[str, ...]) -> str | None:
+    for value in _candidate_values(row, preferred_names):
+        date_key = _date_key(value)
+        if date_key:
+            return date_key
+    return None
+
+
+def _candidate_values(row, preferred_names: tuple[str, ...]):
+    seen = set()
+    for name in preferred_names:
+        if name in row:
+            seen.add(name)
+            yield row.get(name)
+    for name in getattr(row, "index", []):
+        if name in seen:
+            continue
+        compact = _compact_text(str(name)).lower()
+        if any(marker in compact for marker in ("日期", "时间", "date", "time")):
+            yield row.get(name)
+
+
+def _normalize_datetime_text(value) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    compact_digits = re.fullmatch(r"(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})", text)
+    if compact_digits:
+        year, month, day, hour, minute, second = compact_digits.groups()
+        return f"{year}-{month}-{day} {hour}:{minute}:{second}"
+    match = re.search(
+        r"(?P<date>\d{4}[-/]\d{1,2}[-/]\d{1,2})(?:[ T](?P<time>\d{1,2}:\d{2}(?::\d{2})?))?",
+        text,
+    )
+    if not match:
+        return None
+    date_part = _date_key(match.group("date"))
+    if not date_part:
+        return None
+    time_part = match.group("time")
+    if not time_part:
+        return date_part
+    if len(time_part.split(":")) == 2:
+        time_part = f"{time_part}:00"
+    return f"{date_part} {time_part}"
+
+
+def _date_key(value) -> str:
+    text = str(value or "").strip()
+    match = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", text)
+    if not match:
+        return ""
+    year, month, day = match.groups()
+    return f"{year}-{int(month):02d}-{int(day):02d}"
+
+
 def _normalize_stock_code(code: str) -> str:
     raw = str(code or "").strip().upper()
     if "." in raw:
@@ -281,10 +362,20 @@ def _quotes_from_dataframe(df, target_codes: set[str]) -> dict[str, Quote]:
         change_pct = _parse_float(_first_present(row, ("涨跌幅", "涨跌幅%", "change_pct", "最新涨跌幅")))
         if change_pct is None:
             continue
+        quote_time = _extract_datetime_text(
+            row,
+            ("时间", "日期", "更新时间", "最新交易日", "trade_date", "date", "time"),
+        )
+        trade_date = _extract_date_text(
+            row,
+            ("日期", "最新交易日", "交易日期", "trade_date", "date"),
+        ) or _date_key(quote_time)
         result[code] = Quote(
             code=code,
             name=str(_first_present(row, ("名称", "name", "证券简称")) or code),
             change_pct=change_pct,
+            quote_time=quote_time,
+            trade_date=trade_date,
         )
     return result
 
@@ -312,13 +403,20 @@ def _parse_tencent_quotes(text: str, target_codes: set[str]) -> dict[str, Quote]
         change_pct = _parse_tencent_change_pct(fields)
         if change_pct is None:
             continue
-        result[code] = Quote(code=code, name=fields[1] or code, change_pct=change_pct)
+        quote_time = _parse_tencent_quote_time(fields)
+        result[code] = Quote(
+            code=code,
+            name=fields[1] or code,
+            change_pct=change_pct,
+            quote_time=quote_time,
+            trade_date=_date_key(quote_time),
+        )
     return result
 
 
 def _parse_tencent_change_pct(fields: list[str]) -> float | None:
     for index, field in enumerate(fields):
-        if re.fullmatch(r"\d{14}", field) or re.fullmatch(r"\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}", field):
+        if _normalize_datetime_text(field):
             if index + 2 < len(fields):
                 return _parse_float(fields[index + 2])
     for index in (32, 31):
@@ -326,6 +424,14 @@ def _parse_tencent_change_pct(fields: list[str]) -> float | None:
             value = _parse_float(fields[index])
             if value is not None:
                 return value
+    return None
+
+
+def _parse_tencent_quote_time(fields: list[str]) -> str | None:
+    for field in fields:
+        normalized = _normalize_datetime_text(field)
+        if normalized:
+            return normalized
     return None
 
 

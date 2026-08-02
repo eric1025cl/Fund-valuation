@@ -66,6 +66,20 @@ class FakeQuoteAk:
         )
 
 
+class FakeEstimateAk:
+    def fund_value_estimation_em(self, symbol):
+        return pd.DataFrame(
+            [
+                {
+                    "基金代码": "161725",
+                    "交易日-估算数据-估算值": "1.2345",
+                    "交易日-估算数据-估算增长率": "1.23%",
+                    "估算时间": "2026/07/31 15:00:00",
+                }
+            ]
+        )
+
+
 class TencentQuoteProvider(AkshareProvider):
     def _fetch_tencent_quote_text(self, query):
         return """
@@ -150,10 +164,23 @@ class AkshareProviderTests(unittest.TestCase):
 
         self.assertEqual(quotes["600519"].name, "贵州茅台")
         self.assertAlmostEqual(quotes["600519"].change_pct, -1.43)
+        self.assertEqual(quotes["600519"].trade_date, "2026-07-31")
+        self.assertEqual(quotes["600519"].quote_time, "2026-07-31 13:41:23")
         self.assertEqual(quotes["00700"].name, "腾讯控股")
         self.assertAlmostEqual(quotes["00700"].change_pct, 0.42)
         self.assertEqual(quotes["SNDK"].name, "闪迪")
         self.assertAlmostEqual(quotes["SNDK"].change_pct, 25.99)
+
+    def test_official_estimate_includes_source_trade_date(self):
+        provider = TestableProvider(FakeEstimateAk())
+
+        estimate = provider.get_official_estimate("161725")
+
+        self.assertIsNotNone(estimate)
+        self.assertAlmostEqual(estimate.nav, 1.2345)
+        self.assertAlmostEqual(estimate.growth_pct, 1.23)
+        self.assertEqual(estimate.estimate_time, "2026-07-31 15:00:00")
+        self.assertEqual(estimate.trade_date, "2026-07-31")
 
 
 if __name__ == "__main__":

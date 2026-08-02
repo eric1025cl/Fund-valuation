@@ -72,6 +72,82 @@ class WatchlistStoreTests(unittest.TestCase):
         self.assertEqual(rows[0]["snapshot_date"], "2026-07-31")
         self.assertEqual(rows[0]["code"], "161725")
 
+    def test_snapshot_date_prefers_payload_trade_date(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            saved = store.save_snapshot(
+                "2026-08-01 10:00",
+                "2026-08-01 10:00:00",
+                [
+                    {
+                        "code": "161725",
+                        "name": "fund 161725",
+                        "status": "estimated",
+                        "source": "holding",
+                        "estimate_nav": 1.008,
+                        "estimate_growth_pct": 0.8,
+                        "coverage_pct": 50.0,
+                        "confidence": 50.0,
+                        "latest_nav": 1.0,
+                        "latest_nav_date": "2026-07-30",
+                        "trade_date": "2026-07-31",
+                    },
+                ],
+            )
+            snapshots = store.list_snapshots()
+            rows = store.list_unreconciled_valuations()
+
+        self.assertEqual(saved["snapshot_date"], "2026-07-31")
+        self.assertEqual(snapshots[0]["snapshot_date"], "2026-07-31")
+        self.assertEqual(rows[0]["snapshot_date"], "2026-07-31")
+
+    def test_reconciliation_backfills_snapshot_payload(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            store.save_snapshot(
+                "2026-07-31 15:00",
+                "2026-07-31 15:00:00",
+                [
+                    {
+                        "code": "161725",
+                        "name": "fund 161725",
+                        "status": "estimated",
+                        "source": "holding",
+                        "estimate_nav": 1.008,
+                        "estimate_growth_pct": 0.8,
+                        "coverage_pct": 50.0,
+                        "confidence": 50.0,
+                        "latest_nav": 1.0,
+                        "latest_nav_date": "2026-07-30",
+                    },
+                ],
+            )
+
+            store.save_reconciliation(
+                {
+                    "snapshot_key": "2026-07-31 15:00",
+                    "snapshot_date": "2026-07-31",
+                    "code": "161725",
+                    "source": "holding",
+                    "estimate_nav": 1.008,
+                    "estimate_growth_pct": 0.8,
+                    "latest_nav": 1.0,
+                    "actual_nav": 1.009,
+                    "actual_nav_date": "2026-07-31",
+                    "actual_growth_pct": 0.9,
+                    "nav_error_pct": -0.099108,
+                    "abs_nav_error_pct": 0.099108,
+                    "growth_error_pct": -0.1,
+                    "abs_growth_error_pct": 0.1,
+                    "reconciled_at": "2026-08-01 08:00:00",
+                }
+            )
+            rows = store.get_snapshot("2026-07-31 15:00")
+
+        self.assertAlmostEqual(rows[0]["actual_nav"], 1.009)
+        self.assertEqual(rows[0]["actual_nav_date"], "2026-07-31")
+        self.assertAlmostEqual(rows[0]["growth_error_pct"], -0.1)
+
     def test_profiles_recent_reconciliation_errors(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = WatchlistStore(Path(temp_dir) / "funds.db")
@@ -117,7 +193,9 @@ class WatchlistStoreTests(unittest.TestCase):
             profile = store.get_reconciliation_profile("161725", source="holding")
 
         self.assertEqual(profile["sample_count"], 2)
+        self.assertAlmostEqual(profile["mean_nav_error_pct"], -0.05)
         self.assertAlmostEqual(profile["mean_abs_nav_error_pct"], 0.15)
+        self.assertAlmostEqual(profile["mean_growth_error_pct"], -0.1)
         self.assertAlmostEqual(profile["mean_abs_growth_error_pct"], 0.2)
         self.assertAlmostEqual(profile["direction_accuracy_pct"], 50.0)
 

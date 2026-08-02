@@ -97,7 +97,7 @@ class WatchlistStore:
         clean_key = str(snapshot_key or "").strip()
         if not clean_key:
             raise ValueError("snapshot key is required")
-        snapshot_date = _snapshot_date(clean_key, captured_at)
+        snapshot_date = _valuation_snapshot_date(valuations) or _snapshot_date(clean_key, captured_at)
         with closing(self._connect()) as conn:
             conn.execute("DELETE FROM valuation_snapshots WHERE snapshot_key = ?", (clean_key,))
             for item in valuations:
@@ -155,7 +155,7 @@ class WatchlistStore:
             item = json.loads(row["payload_json"])
             item["snapshot_key"] = row["snapshot_key"]
             item["captured_at"] = row["captured_at"]
-            item["snapshot_date"] = _snapshot_date(row["snapshot_key"], row["captured_at"])
+            item["snapshot_date"] = _item_snapshot_date(item, row["snapshot_key"], row["captured_at"])
             result.append(item)
         return result
 
@@ -213,6 +213,7 @@ class WatchlistStore:
                     json.dumps({**reconciliation, "code": code}, ensure_ascii=False),
                 ),
             )
+            self._backfill_snapshot_reconciliation(conn, snapshot_key, code, reconciliation)
             conn.commit()
         return {**reconciliation, "code": code}
 
@@ -233,10 +234,12 @@ class WatchlistStore:
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 f"""
-                SELECT abs_nav_error_pct, abs_growth_error_pct,
+                SELECT nav_error_pct, abs_nav_error_pct,
+                       growth_error_pct, abs_growth_error_pct,
                        estimate_growth_pct, actual_growth_pct
                 FROM (
-                    SELECT abs_nav_error_pct, abs_growth_error_pct,
+                    SELECT nav_error_pct, abs_nav_error_pct,
+                           growth_error_pct, abs_growth_error_pct,
                            estimate_growth_pct, actual_growth_pct,
                            snapshot_date, snapshot_key
                     FROM valuation_reconciliations
@@ -248,7 +251,9 @@ class WatchlistStore:
                 """,
                 params,
             ).fetchall()
+        nav_biases = [_as_float(row["nav_error_pct"]) for row in rows]
         nav_errors = [_as_float(row["abs_nav_error_pct"]) for row in rows]
+        growth_biases = [_as_float(row["growth_error_pct"]) for row in rows]
         growth_errors = [_as_float(row["abs_growth_error_pct"]) for row in rows]
         direction_pairs = [
             (_as_float(row["estimate_growth_pct"]), _as_float(row["actual_growth_pct"]))
@@ -264,7 +269,9 @@ class WatchlistStore:
         )
         return {
             "sample_count": len(rows),
+            "mean_nav_error_pct": _avg(nav_biases),
             "mean_abs_nav_error_pct": _avg(nav_errors),
+            "mean_growth_error_pct": _avg(growth_biases),
             "mean_abs_growth_error_pct": _avg(growth_errors),
             "direction_accuracy_pct": (
                 round(direction_matches / len(direction_pairs) * 100, 4)
@@ -277,7 +284,8 @@ class WatchlistStore:
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 """
-                SELECT snapshot_key, MAX(captured_at) AS captured_at, COUNT(*) AS count
+                SELECT snapshot_key, MAX(captured_at) AS captured_at, COUNT(*) AS count,
+                       MIN(payload_json) AS payload_json
                 FROM valuation_snapshots
                 GROUP BY snapshot_key
                 ORDER BY snapshot_key DESC
@@ -286,7 +294,7 @@ class WatchlistStore:
         return [
             {
                 "snapshot_key": row["snapshot_key"],
-                "snapshot_date": _snapshot_date(row["snapshot_key"], row["captured_at"]),
+                "snapshot_date": _snapshot_list_date(row),
                 "captured_at": row["captured_at"],
                 "count": row["count"],
             }
@@ -308,7 +316,7 @@ class WatchlistStore:
         result = []
         for row in rows:
             item = json.loads(row["payload_json"])
-            item["snapshot_date"] = _snapshot_date(clean_key, item.get("captured_at", ""))
+            item["snapshot_date"] = _item_snapshot_date(item, clean_key, item.get("captured_at", ""))
             result.append(item)
         return result
 
@@ -388,6 +396,37 @@ class WatchlistStore:
         conn.row_factory = sqlite3.Row
         return conn
 
+    @staticmethod
+    def _backfill_snapshot_reconciliation(
+        conn: sqlite3.Connection,
+        snapshot_key: str,
+        code: str,
+        reconciliation: dict,
+    ) -> None:
+        row = conn.execute(
+            """
+            SELECT payload_json
+            FROM valuation_snapshots
+            WHERE snapshot_key = ? AND code = ?
+            """,
+            (snapshot_key, code),
+        ).fetchone()
+        if row is None:
+            return
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        payload.update(_snapshot_reconciliation_patch(reconciliation))
+        conn.execute(
+            """
+            UPDATE valuation_snapshots
+            SET payload_json = ?
+            WHERE snapshot_key = ? AND code = ?
+            """,
+            (json.dumps(payload, ensure_ascii=False), snapshot_key, code),
+        )
+
 
 def _row_to_fund(row: sqlite3.Row) -> WatchFund:
     return WatchFund(
@@ -434,9 +473,48 @@ def _direction(value: float) -> int:
     return 0
 
 
+def _snapshot_reconciliation_patch(reconciliation: dict) -> dict:
+    fields = (
+        "actual_nav",
+        "actual_nav_date",
+        "actual_growth_pct",
+        "nav_error_pct",
+        "abs_nav_error_pct",
+        "growth_error_pct",
+        "abs_growth_error_pct",
+        "reconciled_at",
+    )
+    return {field: reconciliation.get(field) for field in fields if field in reconciliation}
+
+
 def _snapshot_date(snapshot_key: str, captured_at: str) -> str:
     for value in (snapshot_key, captured_at):
         text = str(value or "").strip()
         if len(text) >= 10 and text[4] == "-" and text[7] == "-":
             return text[:10]
+    return ""
+
+
+def _item_snapshot_date(item: dict, snapshot_key: str, captured_at: str) -> str:
+    return _date_key(item.get("trade_date")) or _snapshot_date(snapshot_key, captured_at)
+
+
+def _snapshot_list_date(row: sqlite3.Row) -> str:
+    try:
+        item = json.loads(row["payload_json"] or "{}")
+    except (TypeError, ValueError):
+        item = {}
+    return _item_snapshot_date(item, row["snapshot_key"], row["captured_at"])
+
+
+def _valuation_snapshot_date(valuations: list[dict]) -> str:
+    dates = {_date_key(item.get("trade_date")) for item in valuations}
+    dates.discard("")
+    return dates.pop() if len(dates) == 1 else ""
+
+
+def _date_key(value) -> str:
+    text = str(value or "").strip()
+    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+        return text[:10]
     return ""

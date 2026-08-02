@@ -15,7 +15,10 @@ class StaticPageTests(unittest.TestCase):
         js = Path("web/app.js").read_text(encoding="utf-8")
 
         self.assertIn("交易日 9:00-15:00 页面打开时每 10 分钟自动刷新", html)
+        self.assertIn("非交易日优先使用上一交易日 15:00 估值快照，没有快照则重新计算", html)
+        self.assertIn("估值交易日", html)
         self.assertIn("快照日期", html)
+        self.assertIn("实际净值", js)
         self.assertIn("const AUTO_REFRESH_INTERVAL_MS = 10 * 60 * 1000", js)
         self.assertIn("function isTradingRefreshWindow", js)
         self.assertIn("/api/trading-status", js)

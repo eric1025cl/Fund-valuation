@@ -40,6 +40,9 @@ class FakeProvider:
             "000858": Quote(code="000858", name="五粮液", change_pct=-1.0),
         }
 
+    def is_trading_day(self, current):
+        return True
+
     def health(self):
         return {"fake": "ok"}
 
@@ -72,6 +75,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(reconciliation.json()["reconciled"], 1)
         self.assertEqual(snapshots.json()[0]["count"], 1)
         self.assertEqual(snapshot_rows.json()[0]["code"], "161725")
+        self.assertAlmostEqual(snapshot_rows.json()[0]["actual_nav"], 1.009)
         self.assertEqual(deleted.json(), {"deleted": True})
 
 

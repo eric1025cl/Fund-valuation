@@ -16,6 +16,8 @@ class Quote:
     code: str
     name: str
     change_pct: float
+    quote_time: Optional[str] = None
+    trade_date: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,7 @@ class OfficialEstimate:
     nav: float
     growth_pct: float
     estimate_time: Optional[str] = None
+    trade_date: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -207,6 +210,36 @@ def calibrate_confidence(base_confidence: float, profile: Optional[dict], min_sa
     history_weight = min(0.6, sample_count / 50.0)
     calibrated = base * (1 - history_weight) + error_score * history_weight
     return round(min(95.0, max(0.0, calibrated)), 1)
+
+
+def apply_reconciliation_adjustment(result: dict, profile: Optional[dict], min_samples: int = 5) -> dict:
+    if result.get("status") != "estimated" or result.get("source") != "holding":
+        return result
+    if not profile or int(profile.get("sample_count") or 0) < min_samples:
+        return result
+
+    mean_growth_error = _float_or_none(profile.get("mean_growth_error_pct"))
+    estimate_growth = _float_or_none(result.get("estimate_growth_pct"))
+    latest_nav = _float_or_none(result.get("latest_nav"))
+    if mean_growth_error is None or estimate_growth is None or latest_nav is None or latest_nav <= 0:
+        return result
+
+    sample_count = int(profile.get("sample_count") or 0)
+    adjustment_weight = min(0.75, max(0.25, sample_count / 50.0))
+    adjustment_growth = -mean_growth_error * adjustment_weight
+    if abs(adjustment_growth) < 0.00005:
+        return result
+
+    adjusted_growth = estimate_growth + adjustment_growth
+    adjusted_nav = latest_nav * (1 + adjusted_growth / 100.0)
+    result["raw_estimate_nav"] = result.get("estimate_nav")
+    result["raw_estimate_growth_pct"] = round(estimate_growth, 4)
+    result["estimate_nav"] = round(adjusted_nav, 6)
+    result["estimate_growth_pct"] = round(adjusted_growth, 4)
+    result["adjustment_growth_pct"] = round(adjustment_growth, 4)
+    result["adjustment_weight"] = round(adjustment_weight, 4)
+    result["adjustment_source"] = "historical_reconciliation"
+    return result
 
 
 def _float_or_none(value) -> float | None:

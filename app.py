@@ -125,5 +125,6 @@ app = create_app()
 
 async def _snapshot_scheduler(service: FundValuationService) -> None:
     while True:
-        service.create_due_snapshot()
+        await asyncio.to_thread(service.create_due_snapshot)
+        await asyncio.to_thread(service.reconcile_due_snapshots)
         await asyncio.sleep(30)

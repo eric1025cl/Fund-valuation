@@ -2,10 +2,13 @@ const AUTO_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
 
 const state = {
   view: "live",
+  funds: null,
   valuations: [],
   snapshots: [],
   snapshotRows: [],
   selectedSnapshotKey: null,
+  lastValuationUpdatedAt: null,
+  tradingStatus: null,
 };
 
 const liveView = document.querySelector("#liveView");
@@ -20,6 +23,7 @@ const snapshotButton = document.querySelector("#snapshotButton");
 const fundCount = document.querySelector("#fundCount");
 const estimatedCount = document.querySelector("#estimatedCount");
 const updatedAt = document.querySelector("#updatedAt");
+const tradeDate = document.querySelector("#tradeDate");
 const snapshotCount = document.querySelector("#snapshotCount");
 const selectedSnapshot = document.querySelector("#selectedSnapshot");
 const snapshotDate = document.querySelector("#snapshotDate");
@@ -56,7 +60,7 @@ fundForm.addEventListener("submit", async (event) => {
   }
   fundCode.value = "";
   fundAlias.value = "";
-  await loadLive();
+  await loadFundsOnly();
 });
 
 refreshButton.addEventListener("click", async () => {
@@ -86,12 +90,17 @@ snapshotButton.addEventListener("click", async () => {
 async function loadLive() {
   refreshButton.disabled = true;
   try {
-    const [healthResponse, valuationResponse] = await Promise.all([
+    const [healthResponse, tradingStatusResponse, fundsResponse, valuationResponse] = await Promise.all([
       fetch("/api/health"),
+      fetch("/api/trading-status"),
+      fetch("/api/funds"),
       fetch("/api/valuations"),
     ]);
     const health = await healthResponse.json();
+    state.tradingStatus = await tradingStatusResponse.json();
+    state.funds = await fundsResponse.json();
     state.valuations = await valuationResponse.json();
+    state.lastValuationUpdatedAt = new Date();
     renderHealth(health);
     renderLive();
   } catch (error) {
@@ -99,6 +108,24 @@ async function loadLive() {
   } finally {
     refreshButton.disabled = false;
   }
+}
+
+async function loadFundsOnly() {
+  try {
+    const response = await fetch("/api/funds");
+    if (!response.ok) {
+      throw new Error("failed to load funds");
+    }
+    state.funds = await response.json();
+    renderLive();
+  } catch (error) {
+    showError(fundList, "无法读取自选基金");
+  }
+}
+
+async function loadInitialLive() {
+  await loadFundsOnly();
+  loadLive();
 }
 
 async function loadSnapshots() {
@@ -152,23 +179,72 @@ function renderHealth(health) {
 }
 
 function renderLive() {
-  fundCount.textContent = String(state.valuations.length);
-  estimatedCount.textContent = String(state.valuations.filter((item) => item.status === "estimated").length);
-  updatedAt.textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  const rows = liveRows();
+  fundCount.textContent = String(rows.length);
+  estimatedCount.textContent = String(rows.filter((item) => item.status === "estimated").length);
+  updatedAt.textContent = state.lastValuationUpdatedAt
+    ? state.lastValuationUpdatedAt.toLocaleTimeString("zh-CN", { hour12: false })
+    : "--";
+  tradeDate.textContent = liveTradeDate(rows);
 
-  if (!state.valuations.length) {
+  if (!rows.length) {
     fundList.innerHTML = `<div class="empty">暂无自选基金</div>`;
     return;
   }
 
-  fundList.innerHTML = renderFundTable(state.valuations, true);
+  fundList.innerHTML = renderFundTable(rows, true);
 
   document.querySelectorAll("[data-delete]").forEach((button) => {
     button.addEventListener("click", async () => {
       await fetch(`/api/funds/${button.dataset.delete}`, { method: "DELETE" });
-      await loadLive();
+      await loadFundsOnly();
     });
   });
+}
+
+function liveRows() {
+  const funds = Array.isArray(state.funds)
+    ? state.funds
+    : state.valuations.map((item) => ({ code: item.code, name: item.name, alias: item.alias }));
+  const valuationByCode = new Map(state.valuations.map((item) => [item.code, item]));
+  return funds.map((fund) => {
+    const valuation = valuationByCode.get(fund.code);
+    if (valuation) {
+      return {
+        ...valuation,
+        alias: fund.alias ?? valuation.alias,
+        name: fund.name || valuation.name,
+      };
+    }
+    return {
+      code: fund.code,
+      alias: fund.alias,
+      name: fund.name,
+      status: "pending",
+      source: "待刷新",
+      estimate_nav: null,
+      actual_nav: null,
+      actual_nav_date: null,
+      estimate_growth_pct: null,
+      coverage_pct: null,
+      confidence: null,
+      reason: "等待自动刷新估值",
+      latest_nav: null,
+      latest_nav_date: null,
+      trade_date: state.tradingStatus?.trade_date || null,
+      market_phase: state.tradingStatus?.market_phase || null,
+      is_final: state.tradingStatus?.is_final ?? null,
+      contributions: [],
+    };
+  });
+}
+
+function liveTradeDate(rows) {
+  const dates = rows.map((item) => item.trade_date).filter(Boolean);
+  if (dates.length) {
+    return [...new Set(dates)].join("/");
+  }
+  return state.tradingStatus?.trade_date || "--";
 }
 
 function renderSnapshots() {
@@ -209,6 +285,7 @@ function renderFundTable(items, withDelete) {
       <div class="fund-head">
         <span>基金</span>
         <span>估算净值</span>
+        <span>基准/实际净值</span>
         <span>估算涨跌</span>
         <span>覆盖率</span>
         <span>置信度</span>
@@ -223,15 +300,29 @@ function renderFundTable(items, withDelete) {
 function renderFund(item, withDelete) {
   const growthClass = item.estimate_growth_pct > 0 ? "up" : item.estimate_growth_pct < 0 ? "down" : "neutral";
   const sourceClass = item.status === "estimated" ? "" : "warn";
+  const displayName = item.alias || item.name || item.code;
+  const actualNav = actualNavValue(item);
+  const actualNavDate = actualNavDateValue(item);
+  const meta = [
+    item.code,
+    item.alias && item.name ? item.name : null,
+    formatTradeContext(item),
+    item.reason,
+  ].filter(Boolean).join(" · ");
   return `
     <div class="fund-row">
       <div class="fund-title">
-        <strong>${escapeHtml(item.name || item.code)}</strong>
-        <span>${escapeHtml(item.code)}${item.reason ? ` · ${escapeHtml(item.reason)}` : ""}</span>
+        <strong>${escapeHtml(displayName)}</strong>
+        <span>${escapeHtml(meta)}</span>
       </div>
       <div>
         <span class="cell-label">估算净值</span>
         <div class="value">${formatNumber(item.estimate_nav, 4)}</div>
+      </div>
+      <div>
+        <span class="cell-label">基准/实际净值</span>
+        <div class="value">${formatNumber(actualNav, 4)}</div>
+        ${actualNavDate ? `<span class="cell-note">${escapeHtml(actualNavDate)}</span>` : ""}
       </div>
       <div>
         <span class="cell-label">估算涨跌</span>
@@ -248,9 +339,19 @@ function renderFund(item, withDelete) {
       <div>
         <span class="source-tag ${sourceClass}">${escapeHtml(item.source || item.status)}</span>
       </div>
-      ${withDelete ? `<button class="delete-button" data-delete="${escapeHtml(item.code)}">删除</button>` : "<span></span>"}
+      <div class="fund-action">
+        ${withDelete ? `<button class="delete-button" data-delete="${escapeHtml(item.code)}">删除</button>` : ""}
+      </div>
     </div>
   `;
+}
+
+function actualNavValue(item) {
+  return typeof item.actual_nav === "number" ? item.actual_nav : item.latest_nav;
+}
+
+function actualNavDateValue(item) {
+  return item.actual_nav_date || item.latest_nav_date || null;
 }
 
 function showError(target, message) {
@@ -265,6 +366,13 @@ function formatPercent(value) {
   return typeof value === "number" ? `${value.toFixed(2)}%` : "--";
 }
 
+function formatTradeContext(item) {
+  if (!item.trade_date) {
+    return null;
+  }
+  return item.is_final ? `${item.trade_date} 收盘后` : `${item.trade_date} 盘中`;
+}
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -274,5 +382,5 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
-loadLive();
+loadInitialLive();
 startAutoRefresh();
