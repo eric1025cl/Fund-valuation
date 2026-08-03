@@ -199,6 +199,55 @@ class WatchlistStoreTests(unittest.TestCase):
         self.assertAlmostEqual(profile["mean_abs_growth_error_pct"], 0.2)
         self.assertAlmostEqual(profile["direction_accuracy_pct"], 50.0)
 
+    def test_lists_recent_reconciliation_records(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            store.save_reconciliation(
+                {
+                    "snapshot_key": "2026-07-30 15:00",
+                    "snapshot_date": "2026-07-30",
+                    "code": "161725",
+                    "source": "holding",
+                    "estimate_nav": 1.01,
+                    "estimate_growth_pct": 1.0,
+                    "latest_nav": 1.0,
+                    "actual_nav": 1.009,
+                    "actual_nav_date": "2026-07-30",
+                    "actual_growth_pct": 0.9,
+                    "nav_error_pct": 0.1,
+                    "abs_nav_error_pct": 0.1,
+                    "growth_error_pct": 0.1,
+                    "abs_growth_error_pct": 0.1,
+                    "reconciled_at": "2026-07-31 08:00:00",
+                }
+            )
+            store.save_reconciliation(
+                {
+                    "snapshot_key": "2026-07-31 15:00",
+                    "snapshot_date": "2026-07-31",
+                    "code": "000001",
+                    "source": "official",
+                    "estimate_nav": 1.02,
+                    "estimate_growth_pct": 2.0,
+                    "latest_nav": 1.0,
+                    "actual_nav": 1.019,
+                    "actual_nav_date": "2026-07-31",
+                    "actual_growth_pct": 1.9,
+                    "nav_error_pct": 0.098136,
+                    "abs_nav_error_pct": 0.098136,
+                    "growth_error_pct": 0.1,
+                    "abs_growth_error_pct": 0.1,
+                    "reconciled_at": "2026-08-01 08:00:00",
+                }
+            )
+
+            records = store.list_reconciliations(limit=1)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["snapshot_key"], "2026-07-31 15:00")
+        self.assertEqual(records[0]["code"], "000001")
+        self.assertAlmostEqual(records[0]["abs_nav_error_pct"], 0.098136)
+
 
 if __name__ == "__main__":
     unittest.main()

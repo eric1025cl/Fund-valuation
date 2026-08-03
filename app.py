@@ -94,6 +94,10 @@ def create_app(
     def get_snapshot(snapshot_key: str):
         return valuation_service.get_snapshot(snapshot_key)
 
+    @api.get("/api/reconciliations")
+    def list_reconciliations(limit: int = 50):
+        return valuation_service.list_reconciliations(limit=limit)
+
     @api.post("/api/reconciliations")
     def reconcile_snapshots():
         return valuation_service.reconcile_snapshots()

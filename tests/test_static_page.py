@@ -19,10 +19,23 @@ class StaticPageTests(unittest.TestCase):
         self.assertIn("估值交易日", html)
         self.assertIn("快照日期", html)
         self.assertIn("实际净值", js)
+        self.assertIn("净值涨跌幅", js)
+        self.assertIn("actual_growth_pct", js)
         self.assertIn("const AUTO_REFRESH_INTERVAL_MS = 10 * 60 * 1000", js)
         self.assertIn("function isTradingRefreshWindow", js)
         self.assertIn("/api/trading-status", js)
         self.assertIn("document.hidden", js)
+
+    def test_shows_reconciliation_controls_and_records(self):
+        html = Path("web/index.html").read_text(encoding="utf-8")
+        js = Path("web/app.js").read_text(encoding="utf-8")
+
+        self.assertIn("reconcileButton", html)
+        self.assertIn("reconciliationList", html)
+        self.assertIn("reconciliationStatus", html)
+        self.assertIn("/api/reconciliations", js)
+        self.assertIn("function loadReconciliations", js)
+        self.assertIn("function renderReconciliations", js)
 
 
 if __name__ == "__main__":

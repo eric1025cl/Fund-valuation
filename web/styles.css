@@ -1,6 +1,9 @@
 :root {
   color-scheme: light;
-  --fund-grid: minmax(220px, 1.45fr) repeat(6, minmax(86px, 0.9fr)) 72px;
+  --fund-grid-live: minmax(220px, 1.45fr) repeat(6, minmax(86px, 0.9fr)) 72px;
+  --fund-grid-snapshot: minmax(220px, 1.45fr) repeat(7, minmax(86px, 0.9fr)) 72px;
+  --reconciliation-grid: minmax(190px, 1.4fr) repeat(6, minmax(112px, 1fr));
+  --fund-grid: var(--fund-grid-live);
   --bg: #f4f6f8;
   --surface: #ffffff;
   --surface-strong: #eef2f6;
@@ -219,12 +222,74 @@ input {
   background: #e8eef8;
 }
 
-.fund-card {
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 16px 0 10px;
+}
+
+.section-head h2 {
+  margin: 0;
+  font-size: 17px;
+}
+
+.section-head p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.reconciliation-panel {
+  margin-top: 16px;
+}
+
+.reconciliation-list {
+  display: grid;
+  gap: 10px;
+}
+
+.reconciliation-card {
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: 8px;
   overflow-x: auto;
   overflow-y: hidden;
+}
+
+.reconciliation-head,
+.reconciliation-row {
+  display: grid;
+  grid-template-columns: var(--reconciliation-grid);
+  align-items: center;
+  gap: 10px;
+  min-width: 1040px;
+  padding: 9px 14px;
+}
+
+.reconciliation-head {
+  background: var(--surface-strong);
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.small-value {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.fund-card {
+  --fund-grid: var(--fund-grid-live);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.fund-card.snapshot-fund-card {
+  --fund-grid: var(--fund-grid-snapshot);
 }
 
 .fund-head,
@@ -244,6 +309,15 @@ input {
   justify-content: flex-end;
   align-items: center;
   min-width: 0;
+}
+
+.snapshot-fund-card .fund-action {
+  grid-column: 9;
+}
+
+.snapshot-fund-card .fund-head,
+.snapshot-fund-card .fund-row {
+  min-width: 1080px;
 }
 
 .fund-head {

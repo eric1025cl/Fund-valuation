@@ -6,6 +6,7 @@ const state = {
   valuations: [],
   snapshots: [],
   snapshotRows: [],
+  reconciliations: [],
   selectedSnapshotKey: null,
   lastValuationUpdatedAt: null,
   tradingStatus: null,
@@ -20,6 +21,7 @@ const fundAlias = document.querySelector("#fundAlias");
 const healthLine = document.querySelector("#healthLine");
 const refreshButton = document.querySelector("#refreshButton");
 const snapshotButton = document.querySelector("#snapshotButton");
+const reconcileButton = document.querySelector("#reconcileButton");
 const fundCount = document.querySelector("#fundCount");
 const estimatedCount = document.querySelector("#estimatedCount");
 const updatedAt = document.querySelector("#updatedAt");
@@ -30,6 +32,8 @@ const snapshotDate = document.querySelector("#snapshotDate");
 const snapshotFundCount = document.querySelector("#snapshotFundCount");
 const snapshotList = document.querySelector("#snapshotList");
 const snapshotDetail = document.querySelector("#snapshotDetail");
+const reconciliationStatus = document.querySelector("#reconciliationStatus");
+const reconciliationList = document.querySelector("#reconciliationList");
 
 document.querySelectorAll("[data-view]").forEach((button) => {
   button.addEventListener("click", async () => {
@@ -87,6 +91,30 @@ snapshotButton.addEventListener("click", async () => {
   }
 });
 
+reconcileButton.addEventListener("click", async () => {
+  reconcileButton.disabled = true;
+  reconciliationStatus.textContent = "正在校准对账";
+  try {
+    const response = await fetch("/api/reconciliations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const result = await response.json();
+    reconciliationStatus.textContent = `本次检查 ${result.checked || 0} 条，新增对账 ${result.reconciled || 0} 条，跳过 ${result.skipped || 0} 条`;
+    if (state.view === "snapshots") {
+      await loadSnapshots();
+    } else {
+      state.view = "snapshots";
+      document.querySelector('[data-view="snapshots"]').click();
+    }
+  } catch (error) {
+    reconciliationStatus.textContent = "对账失败";
+  } finally {
+    reconcileButton.disabled = false;
+  }
+});
+
 async function loadLive() {
   refreshButton.disabled = true;
   try {
@@ -140,7 +168,20 @@ async function loadSnapshots() {
   } else {
     state.snapshotRows = [];
   }
+  await loadReconciliations();
   renderSnapshots();
+}
+
+async function loadReconciliations() {
+  try {
+    const response = await fetch("/api/reconciliations");
+    if (!response.ok) {
+      throw new Error("failed to load reconciliations");
+    }
+    state.reconciliations = await response.json();
+  } catch (error) {
+    state.reconciliations = [];
+  }
 }
 
 function isTradingRefreshWindow(date) {
@@ -257,6 +298,7 @@ function renderSnapshots() {
   if (!state.snapshots.length) {
     snapshotList.innerHTML = "";
     snapshotDetail.innerHTML = `<div class="empty">暂无快照数据</div>`;
+    renderReconciliations();
     return;
   }
 
@@ -276,29 +318,97 @@ function renderSnapshots() {
     });
   });
 
-  snapshotDetail.innerHTML = renderFundTable(state.snapshotRows, false);
+  snapshotDetail.innerHTML = renderFundTable(state.snapshotRows, false, true);
+  renderReconciliations();
 }
 
-function renderFundTable(items, withDelete) {
+function renderReconciliations() {
+  const rows = state.reconciliations || [];
+  reconciliationStatus.textContent = rows.length ? `最近 ${rows.length} 条校准样本` : "暂无校准对账记录";
+  if (!rows.length) {
+    reconciliationList.innerHTML = `<div class="empty">暂无校准对账记录</div>`;
+    return;
+  }
+  reconciliationList.innerHTML = `
+    <div class="reconciliation-card">
+      <div class="reconciliation-head">
+        <span>基金</span>
+        <span>快照日期</span>
+        <span>估算净值</span>
+        <span>实际净值</span>
+        <span>涨跌误差</span>
+        <span>净值误差</span>
+        <span>对账时间</span>
+      </div>
+      ${rows.map(renderReconciliation).join("")}
+    </div>
+  `;
+}
+
+function renderReconciliation(item) {
+  const name = item.name || item.code;
+  const meta = [item.code, item.source].filter(Boolean).join(" · ");
   return `
-    <div class="fund-card">
+    <div class="reconciliation-row">
+      <div class="fund-title">
+        <strong>${escapeHtml(name)}</strong>
+        <span>${escapeHtml(meta)}</span>
+      </div>
+      <div>
+        <span class="cell-label">快照日期</span>
+        <div class="value">${escapeHtml(item.snapshot_date || "--")}</div>
+        <span class="cell-note">${escapeHtml(item.snapshot_key || "")}</span>
+      </div>
+      <div>
+        <span class="cell-label">估算净值</span>
+        <div class="value">${formatNumber(item.estimate_nav, 4)}</div>
+        <span class="cell-note">${formatPercent(item.estimate_growth_pct)}</span>
+      </div>
+      <div>
+        <span class="cell-label">实际净值</span>
+        <div class="value">${formatNumber(item.actual_nav, 4)}</div>
+        <span class="cell-note">${escapeHtml(item.actual_nav_date || "")}</span>
+      </div>
+      <div>
+        <span class="cell-label">涨跌误差</span>
+        <div class="value ${percentClass(item.growth_error_pct)}">${formatPercent(item.growth_error_pct)}</div>
+        <span class="cell-note">绝对 ${formatPercent(item.abs_growth_error_pct)}</span>
+      </div>
+      <div>
+        <span class="cell-label">净值误差</span>
+        <div class="value ${percentClass(item.nav_error_pct)}">${formatPercent(item.nav_error_pct)}</div>
+        <span class="cell-note">绝对 ${formatPercent(item.abs_nav_error_pct)}</span>
+      </div>
+      <div>
+        <span class="cell-label">对账时间</span>
+        <div class="value small-value">${escapeHtml(item.reconciled_at || "--")}</div>
+      </div>
+    </div>
+  `;
+}
+
+function renderFundTable(items, withDelete, showActualGrowth = false) {
+  return `
+    <div class="fund-card ${showActualGrowth ? "snapshot-fund-card" : ""}">
       <div class="fund-head">
         <span>基金</span>
         <span>估算净值</span>
         <span>基准/实际净值</span>
         <span>估算涨跌</span>
+        ${showActualGrowth ? "<span>净值涨跌幅</span>" : ""}
         <span>覆盖率</span>
         <span>置信度</span>
         <span>来源</span>
         <span></span>
       </div>
-      ${items.map((item) => renderFund(item, withDelete)).join("")}
+      ${items.map((item) => renderFund(item, withDelete, showActualGrowth)).join("")}
     </div>
   `;
 }
 
-function renderFund(item, withDelete) {
-  const growthClass = item.estimate_growth_pct > 0 ? "up" : item.estimate_growth_pct < 0 ? "down" : "neutral";
+function renderFund(item, withDelete, showActualGrowth = false) {
+  const growthClass = percentClass(item.estimate_growth_pct);
+  const actualGrowthClass = percentClass(item.actual_growth_pct);
   const sourceClass = item.status === "estimated" ? "" : "warn";
   const displayName = item.alias || item.name || item.code;
   const actualNav = actualNavValue(item);
@@ -328,6 +438,11 @@ function renderFund(item, withDelete) {
         <span class="cell-label">估算涨跌</span>
         <div class="value ${growthClass}">${formatPercent(item.estimate_growth_pct)}</div>
       </div>
+      ${showActualGrowth ? `
+      <div>
+        <span class="cell-label">净值涨跌幅</span>
+        <div class="value ${actualGrowthClass}">${formatPercent(item.actual_growth_pct)}</div>
+      </div>` : ""}
       <div>
         <span class="cell-label">覆盖率</span>
         <div class="value">${formatPercent(item.coverage_pct)}</div>
@@ -352,6 +467,13 @@ function actualNavValue(item) {
 
 function actualNavDateValue(item) {
   return item.actual_nav_date || item.latest_nav_date || null;
+}
+
+function percentClass(value) {
+  if (typeof value !== "number") {
+    return "neutral";
+  }
+  return value > 0 ? "up" : value < 0 ? "down" : "neutral";
 }
 
 function showError(target, message) {

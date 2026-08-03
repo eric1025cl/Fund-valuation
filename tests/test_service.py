@@ -399,6 +399,24 @@ class FundValuationServiceTests(unittest.TestCase):
         self.assertAlmostEqual(rows[0]["actual_nav"], 1.009)
         self.assertEqual(rows[0]["actual_nav_date"], "2026-07-31")
 
+    def test_lists_reconciliation_records_for_display(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(
+                store=store,
+                provider=FakeProvider(nav_by_date={"2026-07-31": LatestNav(nav=1.009, date="2026-07-31")}),
+            )
+            service.add_fund("161725", "fund")
+            service.create_snapshot(snapshot_key="2026-07-31 15:00", captured_at="2026-07-31 15:00:00")
+            service.reconcile_snapshots(now=datetime(2026, 8, 1, 8, 0, 0))
+
+            records = service.list_reconciliations()
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["code"], "161725")
+        self.assertEqual(records[0]["snapshot_date"], "2026-07-31")
+        self.assertAlmostEqual(records[0]["abs_growth_error_pct"], 0.1)
+
     def test_due_reconciliation_retries_skipped_snapshots_after_interval(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = WatchlistStore(Path(temp_dir) / "funds.db")

@@ -280,6 +280,30 @@ class WatchlistStore:
             ),
         }
 
+    def list_reconciliations(self, limit: int = 50) -> list[dict]:
+        row_limit = min(200, max(1, int(limit or 50)))
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT vr.payload_json, vs.payload_json AS snapshot_payload_json
+                FROM valuation_reconciliations vr
+                LEFT JOIN valuation_snapshots vs
+                    ON vs.snapshot_key = vr.snapshot_key
+                   AND vs.code = vr.code
+                ORDER BY vr.snapshot_date DESC, vr.snapshot_key DESC, vr.code ASC
+                LIMIT ?
+                """,
+                (row_limit,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = json.loads(row["payload_json"])
+            snapshot_payload = _json_or_empty(row["snapshot_payload_json"])
+            if snapshot_payload.get("name") and not item.get("name"):
+                item["name"] = snapshot_payload["name"]
+            result.append(item)
+        return result
+
     def list_snapshots(self) -> list[dict]:
         with closing(self._connect()) as conn:
             rows = conn.execute(
@@ -485,6 +509,14 @@ def _snapshot_reconciliation_patch(reconciliation: dict) -> dict:
         "reconciled_at",
     )
     return {field: reconciliation.get(field) for field in fields if field in reconciliation}
+
+
+def _json_or_empty(value) -> dict:
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _snapshot_date(snapshot_key: str, captured_at: str) -> str:

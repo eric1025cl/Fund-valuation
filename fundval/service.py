@@ -216,6 +216,9 @@ class FundValuationService:
         self._last_reconciliation_attempt_at = current
         return self.reconcile_snapshots(now=current)
 
+    def list_reconciliations(self, limit: int = 50) -> list[dict]:
+        return self.store.list_reconciliations(limit=limit)
+
     def health(self) -> dict:
         return self._safe_call(self.provider.health) or {"provider": "unavailable"}
 
