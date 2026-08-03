@@ -3,6 +3,7 @@ from datetime import datetime
 
 import pandas as pd
 
+from fundval.factor_fit import MarketFactor
 from fundval.providers import AkshareProvider
 
 
@@ -76,6 +77,33 @@ class FakeEstimateAk:
                     "交易日-估算数据-估算增长率": "1.23%",
                     "估算时间": "2026/07/31 15:00:00",
                 }
+            ]
+        )
+
+
+class FakeFactorAk:
+    def fund_open_fund_info_em(self, symbol, indicator):
+        return pd.DataFrame(
+            [
+                {"净值日期": "2026-07-29", "单位净值": 1.0},
+                {"净值日期": "2026-07-30", "单位净值": 1.01},
+                {"净值日期": "2026-07-31", "单位净值": 1.0201},
+            ]
+        )
+
+    def stock_zh_index_daily(self, symbol):
+        return pd.DataFrame(
+            [
+                {"date": "2026-07-29", "close": 100.0},
+                {"date": "2026-07-30", "close": 101.0},
+                {"date": "2026-07-31", "close": 102.01},
+            ]
+        )
+
+    def stock_zh_index_spot_em(self):
+        return pd.DataFrame(
+            [
+                {"代码": "000300", "名称": "沪深300", "涨跌幅": 1.5},
             ]
         )
 
@@ -181,6 +209,20 @@ class AkshareProviderTests(unittest.TestCase):
         self.assertAlmostEqual(estimate.growth_pct, 1.23)
         self.assertEqual(estimate.estimate_time, "2026-07-31 15:00:00")
         self.assertEqual(estimate.trade_date, "2026-07-31")
+
+    def test_factor_history_and_quotes_are_normalized(self):
+        provider = TestableProvider(FakeFactorAk())
+        provider.factor_universe = [MarketFactor(code="sh000300", name="CSI 300")]
+
+        nav_history = provider.get_nav_history("161725")
+        factor_histories = provider.get_factor_histories()
+        factor_quotes = provider.get_factor_quotes(["sh000300"])
+
+        self.assertEqual(nav_history[-1].date, "2026-07-31")
+        self.assertAlmostEqual(nav_history[-1].value, 1.0201)
+        self.assertIn("sh000300", factor_histories)
+        self.assertEqual(factor_histories["sh000300"][-1].date, "2026-07-31")
+        self.assertAlmostEqual(factor_quotes["sh000300"].change_pct, 1.5)
 
 
 if __name__ == "__main__":

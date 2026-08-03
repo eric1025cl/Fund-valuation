@@ -416,6 +416,8 @@ function renderFund(item, withDelete, showActualGrowth = false) {
   const displayName = item.alias || item.name || item.code;
   const actualNav = actualNavValue(item);
   const actualNavDate = navDateLabel(item);
+  const factorNote = factorFitLabel(item);
+  const driftNote = styleDriftLabel(item);
   const meta = [
     item.code,
     item.alias && item.name ? item.name : null,
@@ -440,6 +442,7 @@ function renderFund(item, withDelete, showActualGrowth = false) {
       <div>
         <span class="cell-label">估算涨跌</span>
         <div class="value ${growthClass}">${formatPercent(item.estimate_growth_pct)}</div>
+        ${factorNote ? `<span class="cell-note">${escapeHtml(factorNote)}</span>` : ""}
       </div>
       ${showActualGrowth ? `
       <div>
@@ -453,6 +456,7 @@ function renderFund(item, withDelete, showActualGrowth = false) {
       <div>
         <span class="cell-label">置信度</span>
         <div class="value">${formatPercent(item.confidence)}</div>
+        ${driftNote ? `<span class="cell-note">${escapeHtml(driftNote)}</span>` : ""}
       </div>
       <div>
         <span class="source-tag ${sourceClass}">${escapeHtml(sourceText)}</span>
@@ -470,10 +474,10 @@ function actualNavValue(item) {
 
 function navDateLabel(item) {
   if (item.actual_nav_date) {
-    return `实际净值日 ${item.actual_nav_date}`;
+    return item.actual_nav_date;
   }
   if (item.latest_nav_date) {
-    return `基准净值日 ${item.latest_nav_date}`;
+    return item.latest_nav_date;
   }
   return null;
 }
@@ -483,9 +487,33 @@ function sourceLabel(item) {
     nav: "正式净值",
     official: "官方估算",
     holding: "持仓估算",
+    factor_fit: "指数拟合",
     snapshot: "快照",
   };
   return labels[item.source] || item.source || item.status || "";
+}
+
+function factorFitLabel(item) {
+  const growth = typeof item.fit_growth_pct === "number" ? item.fit_growth_pct : (
+    item.source === "factor_fit" ? item.estimate_growth_pct : null
+  );
+  if (typeof growth !== "number") {
+    return null;
+  }
+  const r2 = typeof item.fit_r2 === "number" ? ` / R² ${item.fit_r2.toFixed(2)}` : "";
+  return `指数拟合 ${formatPercent(growth)}${r2}`;
+}
+
+function styleDriftLabel(item) {
+  if (typeof item.style_drift_score !== "number") {
+    return null;
+  }
+  const level = {
+    low: "低",
+    medium: "中",
+    high: "高",
+  }[item.style_drift_level] || item.style_drift_level || "低";
+  return `风格漂移 ${level} ${item.style_drift_score.toFixed(1)}`;
 }
 
 function percentClass(value) {

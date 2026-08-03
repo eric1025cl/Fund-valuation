@@ -5,6 +5,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Any
 
+from .factor_fit import DEFAULT_FACTOR_UNIVERSE, FactorPoint
 from .valuation import Holding, LatestNav, OfficialEstimate, Quote
 
 
@@ -12,6 +13,7 @@ class AkshareProvider:
     def __init__(self, cache_ttl_seconds: int = 300):
         self.cache_ttl = timedelta(seconds=cache_ttl_seconds)
         self._cache: dict[str, tuple[datetime, Any]] = {}
+        self.factor_universe = list(DEFAULT_FACTOR_UNIVERSE)
 
     def get_fund_name(self, code: str) -> str | None:
         df = self._cached("fund_names", self._fetch_fund_names, timedelta(hours=12))
@@ -81,6 +83,16 @@ class AkshareProvider:
                 return None
             return LatestNav(nav=nav, date=row_date)
         return None
+
+    def get_nav_history(self, code: str, limit: int = 120) -> list[FactorPoint]:
+        ak = self._ak()
+        df = ak.fund_open_fund_info_em(symbol=code, indicator="单位净值走势")
+        return _points_from_dataframe(
+            df,
+            date_names=("净值日期", "日期", "date"),
+            value_names=("单位净值", "净值", "NAV"),
+            limit=limit,
+        )
 
     def get_holdings(self, code: str) -> list[Holding]:
         ak = self._ak()
@@ -180,6 +192,37 @@ class AkshareProvider:
                 break
         return result
 
+    def get_factor_histories(self, limit: int = 120) -> dict[str, list[FactorPoint]]:
+        result: dict[str, list[FactorPoint]] = {}
+        row_limit = max(2, int(limit or 120))
+        for factor in self.factor_universe:
+            points = self._cached(
+                f"factor_history:{factor.code}",
+                lambda current=factor.code: self._fetch_factor_history(current),
+                timedelta(hours=6),
+            )
+            if points:
+                result[factor.code] = points[-row_limit:]
+        return result
+
+    def get_factor_quotes(self, factor_codes: list[str]) -> dict[str, Quote]:
+        requested = {str(code or "").strip() for code in factor_codes if str(code or "").strip()}
+        if not requested:
+            return {}
+        names = {factor.code: factor.name for factor in self.factor_universe}
+        result = self._cached(
+            "factor_quotes",
+            self._fetch_factor_quotes,
+            timedelta(seconds=60),
+        )
+        quotes = {code: quote for code, quote in (result or {}).items() if code in requested}
+        missing = requested - set(quotes)
+        for code in missing:
+            fallback = self._factor_quote_from_history(code, names.get(code, code))
+            if fallback is not None:
+                quotes[code] = fallback
+        return quotes
+
     def _get_tencent_quotes(self, codes: set[str]) -> dict[str, Quote]:
         query = ",".join(_tencent_symbol(code) for code in sorted(codes))
         if not query:
@@ -238,6 +281,39 @@ class AkshareProvider:
             if function is not None:
                 return function(symbol=symbol)
         raise AttributeError("akshare fund value estimation API is unavailable")
+
+    def _fetch_factor_history(self, symbol: str) -> list[FactorPoint]:
+        ak = self._ak()
+        df = ak.stock_zh_index_daily(symbol=symbol)
+        return _points_from_dataframe(
+            df,
+            date_names=("date", "日期", "trade_date"),
+            value_names=("close", "收盘", "收盘价"),
+        )
+
+    def _fetch_factor_quotes(self) -> dict[str, Quote]:
+        ak = self._ak()
+        df = ak.stock_zh_index_spot_em()
+        return _index_quotes_from_dataframe(df, self.factor_universe)
+
+    def _factor_quote_from_history(self, code: str, name: str) -> Quote | None:
+        points = self._cached(
+            f"factor_history:{code}",
+            lambda current=code: self._fetch_factor_history(current),
+            timedelta(hours=6),
+        )
+        if points is None or len(points) < 2:
+            return None
+        previous = points[-2]
+        latest = points[-1]
+        if previous.value <= 0:
+            return None
+        return Quote(
+            code=code,
+            name=name,
+            change_pct=(latest.value / previous.value - 1) * 100.0,
+            trade_date=latest.date,
+        )
 
     def _cached(self, key: str, loader, ttl: timedelta | None = None):
         now = datetime.now()
@@ -378,6 +454,59 @@ def _quotes_from_dataframe(df, target_codes: set[str]) -> dict[str, Quote]:
             trade_date=trade_date,
         )
     return result
+
+
+def _points_from_dataframe(
+    df,
+    date_names: tuple[str, ...],
+    value_names: tuple[str, ...],
+    limit: int | None = None,
+) -> list[FactorPoint]:
+    if df is None or df.empty:
+        return []
+    points: list[FactorPoint] = []
+    for _, row in df.iterrows():
+        date = _date_key(_first_present(row, date_names))
+        value = _parse_float(_first_present(row, value_names))
+        if date and value is not None and value > 0:
+            points.append(FactorPoint(date=date, value=value))
+    points.sort(key=lambda item: item.date)
+    if limit is not None:
+        return points[-max(2, int(limit or 2)) :]
+    return points
+
+
+def _index_quotes_from_dataframe(df, factor_universe) -> dict[str, Quote]:
+    if df is None or df.empty:
+        return {}
+    symbol_by_digits = {_index_digits(factor.code): factor.code for factor in factor_universe}
+    names = {factor.code: factor.name for factor in factor_universe}
+    result: dict[str, Quote] = {}
+    for _, row in df.iterrows():
+        digits = _index_digits(str(_first_present(row, ("代码", "symbol", "指数代码")) or ""))
+        code = symbol_by_digits.get(digits)
+        if not code:
+            continue
+        change_pct = _parse_float(_first_present(row, ("涨跌幅", "涨跌幅%", "change_pct")))
+        if change_pct is None:
+            continue
+        quote_time = _extract_datetime_text(
+            row,
+            ("时间", "日期", "更新时间", "最新交易日", "trade_date", "date", "time"),
+        )
+        result[code] = Quote(
+            code=code,
+            name=str(_first_present(row, ("名称", "name", "指数简称")) or names.get(code) or code),
+            change_pct=change_pct,
+            quote_time=quote_time,
+            trade_date=_date_key(quote_time),
+        )
+    return result
+
+
+def _index_digits(code: str) -> str:
+    digits = "".join(ch for ch in str(code or "") if ch.isdigit())
+    return digits[-6:] if len(digits) >= 6 else digits
 
 
 def _tencent_symbol(code: str) -> str:

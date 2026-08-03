@@ -9,6 +9,8 @@ class StaticPageTests(unittest.TestCase):
         self.assertIn("覆盖率 = 参与估值的持仓权重合计", html)
         self.assertIn("置信度不是准确率概率", html)
         self.assertIn("低覆盖率估值仅代表方向参考", html)
+        self.assertIn("指数拟合", html)
+        self.assertIn("风格漂移", html)
 
     def test_explains_trading_refresh_and_snapshot_date(self):
         html = Path("web/index.html").read_text(encoding="utf-8")
@@ -22,8 +24,10 @@ class StaticPageTests(unittest.TestCase):
         self.assertIn("净值涨跌幅", js)
         self.assertIn("估值日", js)
         self.assertIn("本地交易日", js)
-        self.assertIn("实际净值日", js)
-        self.assertIn("基准净值日", js)
+        self.assertNotIn("实际净值日", js)
+        self.assertNotIn("基准净值日", js)
+        self.assertIn("指数拟合", js)
+        self.assertIn("风格漂移", js)
         self.assertIn("actual_growth_pct", js)
         self.assertIn("const AUTO_REFRESH_INTERVAL_MS = 10 * 60 * 1000", js)
         self.assertIn("function isTradingRefreshWindow", js)

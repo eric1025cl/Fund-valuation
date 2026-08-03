@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>基金估值看板</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260801-row-actions" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260803-factor-fit" />
   </head>
   <body>
     <main class="shell">
@@ -58,6 +58,7 @@
           <p><strong>覆盖率 = 参与估值的持仓权重合计。</strong>例如覆盖率 17.85%，表示当前成功拿到行情并参与计算的披露持仓权重合计为 17.85%。</p>
           <p><strong>置信度不是准确率概率。</strong>它是系统根据数据来源和覆盖率给出的质量评分；官方估值通常更高，持仓穿透估值会随覆盖率下降。</p>
           <p>ETF 联接和 QDII 允许低覆盖率归一化估算，低覆盖率估值仅代表方向参考，后续应结合 15:00 快照与实际净值误差一起看。</p>
+          <p><strong>指数拟合</strong>会用基金历史净值涨跌拟合宽基/行业指数暴露，在持仓覆盖不足时作为备用估值，并显示 <strong>风格漂移</strong> 提示。</p>
         </section>
 
         <section id="fundList" class="fund-list" aria-label="估值列表"></section>
@@ -97,6 +98,6 @@
 
       <p class="disclaimer">估值基于公开数据和披露持仓，仅供参考，不构成投资建议。交易日 9:00-15:00 页面打开时每 10 分钟自动刷新；非交易日优先使用上一交易日 15:00 估值快照，没有快照则重新计算；每个交易日 15:00 自动保存一份带日期标记的估值快照。</p>
     </main>
-    <script src="/static/app.js?v=20260801-row-actions"></script>
+    <script src="/static/app.js?v=20260803-factor-fit"></script>
   </body>
 </html>

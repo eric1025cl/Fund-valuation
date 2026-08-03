@@ -4,6 +4,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Protocol
 
 from .store import WatchFund, WatchlistStore, normalize_fund_code
+from .factor_fit import fit_factor_model
 from .valuation import (
     Holding,
     LatestNav,
@@ -137,6 +138,26 @@ class FundValuationService:
             quotes=quotes,
             min_coverage_pct=self._coverage_floor(name or ""),
         ).to_dict()
+        factor_result = self._factor_fit_estimate(fund_code, latest_nav)
+        if result.get("status") != "estimated" and factor_result is not None and factor_result.status == "estimated":
+            factor_data = factor_result.to_dict()
+            factor_data.update(
+                {
+                    "code": fund_code,
+                    "name": name or f"基金{fund_code}",
+                    "estimate_time": None,
+                    "holding_reason": result.get("reason"),
+                    "holding_coverage_pct": result.get("coverage_pct"),
+                }
+            )
+            self._attach_valuation_context(
+                factor_data,
+                context,
+                trade_date=factor_data.get("trade_date") or target_trade_date,
+            )
+            return self._with_calibrated_confidence(fund_code, factor_data)
+
+        self._attach_factor_monitoring(result, factor_result)
         result.update(
             {
                 "code": fund_code,
@@ -293,6 +314,48 @@ class FundValuationService:
         }
         self._attach_valuation_context(result, context, trade_date=target_nav_date)
         return result
+
+    def _factor_fit_estimate(self, fund_code: str, latest_nav: LatestNav | None):
+        nav_history = getattr(self.provider, "get_nav_history", None)
+        factor_histories = getattr(self.provider, "get_factor_histories", None)
+        factor_quotes = getattr(self.provider, "get_factor_quotes", None)
+        if not callable(nav_history) or not callable(factor_histories) or not callable(factor_quotes):
+            return None
+
+        history = self._safe_call(lambda: nav_history(fund_code, limit=120)) or []
+        histories = self._safe_call(lambda: factor_histories(limit=120)) or {}
+        if not histories:
+            return None
+        quotes = self._safe_call(lambda: factor_quotes(list(histories.keys()))) or {}
+        return fit_factor_model(
+            latest_nav=latest_nav,
+            fund_history=history,
+            factor_histories=histories,
+            factor_quotes=quotes,
+        )
+
+    @staticmethod
+    def _attach_factor_monitoring(result: dict, factor_result) -> None:
+        if factor_result is None or factor_result.status != "estimated":
+            return
+        factor_data = factor_result.to_dict()
+        result.update(
+            {
+                "fit_source": factor_data.get("source"),
+                "fit_nav": factor_data.get("estimate_nav"),
+                "fit_growth_pct": factor_data.get("estimate_growth_pct"),
+                "fit_confidence": factor_data.get("confidence"),
+                "fit_r2": factor_data.get("fit_r2"),
+                "fit_residual_pct": factor_data.get("fit_residual_pct"),
+                "fit_sample_count": factor_data.get("sample_count"),
+                "factor_exposures": factor_data.get("factor_exposures"),
+                "baseline_factor_exposures": factor_data.get("baseline_factor_exposures"),
+                "recent_factor_exposures": factor_data.get("recent_factor_exposures"),
+                "style_drift_score": factor_data.get("style_drift_score"),
+                "style_drift_level": factor_data.get("style_drift_level"),
+                "style_drift_reason": factor_data.get("style_drift_reason"),
+            }
+        )
 
     def _published_nav_for_target(
         self,

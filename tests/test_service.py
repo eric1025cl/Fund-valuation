@@ -5,10 +5,20 @@ from pathlib import Path
 
 from fundval.service import FundValuationService
 from fundval.store import WatchlistStore
+from fundval.factor_fit import FactorPoint
 from fundval.valuation import Holding, LatestNav, OfficialEstimate, Quote
 
 
 TRADING_TIME = datetime(2026, 7, 31, 10, 0, 0)
+
+
+def factor_points(start_value, returns):
+    points = [FactorPoint("2026-07-01", start_value)]
+    value = start_value
+    for index, growth_pct in enumerate(returns, start=2):
+        value *= 1 + growth_pct / 100.0
+        points.append(FactorPoint(f"2026-07-{index:02d}", value))
+    return points
 
 
 class FakeProvider:
@@ -401,6 +411,63 @@ class FundValuationServiceTests(unittest.TestCase):
         self.assertEqual(result["source"], "holding")
         self.assertAlmostEqual(result["coverage_pct"], 0.39)
         self.assertAlmostEqual(result["estimate_growth_pct"], -2.0)
+
+    def test_low_coverage_holding_falls_back_to_factor_fit(self):
+        class FactorFallbackProvider(FakeProvider):
+            def get_holdings(self, code):
+                return [Holding(name="Tiny Holding", code="600519", weight_pct=5.0)]
+
+            def get_quotes(self, stock_codes):
+                return {"600519": Quote(code="600519", name="Tiny Holding", change_pct=1.0)}
+
+            def get_nav_history(self, code, limit=120):
+                return factor_points(1.0, [1.0] * 24)
+
+            def get_factor_histories(self, limit=120):
+                return {
+                    "sh000300": factor_points(100.0, [1.0] * 24),
+                }
+
+            def get_factor_quotes(self, factor_codes):
+                return {"sh000300": Quote(code="sh000300", name="CSI 300", change_pct=1.5)}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=FactorFallbackProvider())
+
+            result = service.estimate_fund("161725", now=TRADING_TIME)
+
+        self.assertEqual(result["status"], "estimated")
+        self.assertEqual(result["source"], "factor_fit")
+        self.assertAlmostEqual(result["estimate_growth_pct"], 1.5, places=3)
+        self.assertAlmostEqual(result["estimate_nav"], 1.015, places=3)
+        self.assertAlmostEqual(result["fit_r2"], 1.0, places=3)
+        self.assertIn("factor_exposures", result)
+
+    def test_holding_estimate_includes_factor_fit_monitoring_fields(self):
+        class FactorMonitorProvider(FakeProvider):
+            def get_nav_history(self, code, limit=120):
+                return factor_points(1.0, [1.0] * 24)
+
+            def get_factor_histories(self, limit=120):
+                return {
+                    "sh000300": factor_points(100.0, [1.0] * 24),
+                }
+
+            def get_factor_quotes(self, factor_codes):
+                return {"sh000300": Quote(code="sh000300", name="CSI 300", change_pct=1.2)}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=FactorMonitorProvider())
+
+            result = service.estimate_fund("161725", now=TRADING_TIME)
+
+        self.assertEqual(result["source"], "holding")
+        self.assertAlmostEqual(result["fit_growth_pct"], 1.2, places=3)
+        self.assertAlmostEqual(result["fit_nav"], 1.012, places=3)
+        self.assertIn("style_drift_score", result)
+        self.assertIn("factor_exposures", result)
 
     def test_creates_and_lists_snapshot_batches(self):
         with tempfile.TemporaryDirectory() as temp_dir:
