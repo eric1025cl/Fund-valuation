@@ -273,6 +273,8 @@ function liveRows() {
       latest_nav: null,
       latest_nav_date: null,
       trade_date: state.tradingStatus?.trade_date || null,
+      target_trade_date: state.tradingStatus?.trade_date || null,
+      context_trade_date: state.tradingStatus?.trade_date || null,
       market_phase: state.tradingStatus?.market_phase || null,
       is_final: state.tradingStatus?.is_final ?? null,
       contributions: [],
@@ -410,9 +412,10 @@ function renderFund(item, withDelete, showActualGrowth = false) {
   const growthClass = percentClass(item.estimate_growth_pct);
   const actualGrowthClass = percentClass(item.actual_growth_pct);
   const sourceClass = item.status === "estimated" ? "" : "warn";
+  const sourceText = sourceLabel(item);
   const displayName = item.alias || item.name || item.code;
   const actualNav = actualNavValue(item);
-  const actualNavDate = actualNavDateValue(item);
+  const actualNavDate = navDateLabel(item);
   const meta = [
     item.code,
     item.alias && item.name ? item.name : null,
@@ -452,7 +455,7 @@ function renderFund(item, withDelete, showActualGrowth = false) {
         <div class="value">${formatPercent(item.confidence)}</div>
       </div>
       <div>
-        <span class="source-tag ${sourceClass}">${escapeHtml(item.source || item.status)}</span>
+        <span class="source-tag ${sourceClass}">${escapeHtml(sourceText)}</span>
       </div>
       <div class="fund-action">
         ${withDelete ? `<button class="delete-button" data-delete="${escapeHtml(item.code)}">删除</button>` : ""}
@@ -465,8 +468,24 @@ function actualNavValue(item) {
   return typeof item.actual_nav === "number" ? item.actual_nav : item.latest_nav;
 }
 
-function actualNavDateValue(item) {
-  return item.actual_nav_date || item.latest_nav_date || null;
+function navDateLabel(item) {
+  if (item.actual_nav_date) {
+    return `实际净值日 ${item.actual_nav_date}`;
+  }
+  if (item.latest_nav_date) {
+    return `基准净值日 ${item.latest_nav_date}`;
+  }
+  return null;
+}
+
+function sourceLabel(item) {
+  const labels = {
+    nav: "正式净值",
+    official: "官方估算",
+    holding: "持仓估算",
+    snapshot: "快照",
+  };
+  return labels[item.source] || item.source || item.status || "";
 }
 
 function percentClass(value) {
@@ -492,7 +511,13 @@ function formatTradeContext(item) {
   if (!item.trade_date) {
     return null;
   }
-  return item.is_final ? `${item.trade_date} 收盘后` : `${item.trade_date} 盘中`;
+  const targetDate = item.target_trade_date || item.trade_date;
+  const phase = item.is_final ? "收盘后" : "盘中";
+  const labels = [`估值日 ${targetDate} ${phase}`];
+  if (item.context_trade_date && item.context_trade_date !== targetDate) {
+    labels.push(`本地交易日 ${item.context_trade_date}`);
+  }
+  return labels.join(" / ");
 }
 
 function escapeHtml(value) {

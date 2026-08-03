@@ -340,6 +340,46 @@ class FundValuationServiceTests(unittest.TestCase):
         self.assertEqual(result["latest_nav_date"], "2026-07-30")
         self.assertTrue(result["is_final"])
 
+    def test_qdii_uses_previous_trade_date_nav_during_trading(self):
+        class QdiiPublishedNavProvider(FakeProvider):
+            def get_fund_name(self, code):
+                return "华夏全球精选QDII"
+
+            def get_latest_nav(self, code):
+                return LatestNav(nav=1.052, date="2026-07-30")
+
+            def get_nav_by_date(self, code, nav_date):
+                if nav_date == "2026-07-29":
+                    return LatestNav(nav=1.04, date="2026-07-29")
+                return None
+
+            def get_official_estimate(self, code):
+                raise AssertionError("published QDII NAV should skip official estimate")
+
+            def get_holdings(self, code):
+                raise AssertionError("published QDII NAV should skip holding fallback")
+
+            def get_quotes(self, stock_codes):
+                raise AssertionError("published QDII NAV should skip quote fallback")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=QdiiPublishedNavProvider())
+
+            result = service.estimate_fund("000041", now=TRADING_TIME)
+
+        self.assertEqual(result["source"], "nav")
+        self.assertEqual(result["trade_date"], "2026-07-30")
+        self.assertEqual(result["target_trade_date"], "2026-07-30")
+        self.assertEqual(result["context_trade_date"], "2026-07-31")
+        self.assertEqual(result["market_phase"], "closed")
+        self.assertTrue(result["is_final"])
+        self.assertAlmostEqual(result["estimate_nav"], 1.052)
+        self.assertAlmostEqual(result["actual_nav"], 1.052)
+        self.assertEqual(result["actual_nav_date"], "2026-07-30")
+        self.assertAlmostEqual(result["latest_nav"], 1.04)
+        self.assertEqual(result["latest_nav_date"], "2026-07-29")
+
     def test_etf_link_uses_lower_coverage_floor_for_holding_estimate(self):
         class EtfProvider(FakeProvider):
             def get_fund_name(self, code):

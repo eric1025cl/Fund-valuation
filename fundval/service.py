@@ -83,10 +83,24 @@ class FundValuationService:
         if use_snapshot_cache and self._should_use_previous_close_snapshot(context):
             fund = self.store.get_fund(fund_code) or WatchFund(code=fund_code)
             return self._snapshot_estimate_for_fund(fund, context, current)
-        name = self._safe_call(lambda: self.provider.get_fund_name(fund_code))
+        stored_fund = self.store.get_fund(fund_code)
+        name = self._safe_call(lambda: self.provider.get_fund_name(fund_code)) or (
+            stored_fund.name if stored_fund else None
+        )
+        latest_nav = self._safe_call(lambda: self.provider.get_latest_nav(fund_code))
+        target_trade_date = self._target_trade_date(name or "", context)
+        actual_nav_result = self._actual_nav_estimate(
+            fund_code,
+            name or "",
+            latest_nav,
+            context,
+            target_trade_date,
+        )
+        if actual_nav_result is not None:
+            return self._with_calibrated_confidence(fund_code, actual_nav_result)
+
         official = self._safe_call(lambda: self.provider.get_official_estimate(fund_code))
         if official is not None:
-            latest_nav = self._safe_call(lambda: self.provider.get_latest_nav(fund_code))
             latest_nav_value = round(float(latest_nav.nav), 6) if latest_nav is not None and latest_nav.nav > 0 else None
             result = {
                 "code": fund_code,
@@ -103,17 +117,17 @@ class FundValuationService:
                 "estimate_time": official.estimate_time,
                 "contributions": [],
             }
+            official_trade_date = _date_key(official.trade_date)
+            if _is_qdii_name(name or "") and (
+                not official_trade_date or official_trade_date > target_trade_date
+            ):
+                official_trade_date = target_trade_date
             self._attach_valuation_context(
                 result,
                 context,
-                trade_date=_date_key(official.trade_date) or _date_key(official.estimate_time),
+                trade_date=official_trade_date or _date_key(official.estimate_time),
             )
             return self._with_calibrated_confidence(fund_code, result)
-
-        latest_nav = self._safe_call(lambda: self.provider.get_latest_nav(fund_code))
-        actual_nav_result = self._actual_nav_estimate(fund_code, name or "", latest_nav, context)
-        if actual_nav_result is not None:
-            return self._with_calibrated_confidence(fund_code, actual_nav_result)
 
         holdings = self._safe_call(lambda: self.provider.get_holdings(fund_code)) or []
         quotes = self._safe_call(lambda: self.provider.get_quotes([h.code for h in holdings])) or {}
@@ -130,7 +144,12 @@ class FundValuationService:
                 "estimate_time": None,
             }
         )
-        self._attach_valuation_context(result, context, trade_date=_quote_trade_date(quotes))
+        holding_trade_date = _quote_trade_date(quotes)
+        if _is_qdii_name(name or "") and (
+            not holding_trade_date or holding_trade_date > target_trade_date
+        ):
+            holding_trade_date = target_trade_date
+        self._attach_valuation_context(result, context, trade_date=holding_trade_date or target_trade_date)
         return self._with_calibrated_confidence(fund_code, result)
 
     def create_snapshot(
@@ -240,38 +259,64 @@ class FundValuationService:
         fund_name: str,
         latest_nav: LatestNav | None,
         context: dict,
+        target_trade_date: str,
     ) -> dict | None:
-        if latest_nav is None or latest_nav.nav <= 0:
-            return None
-        latest_nav_date = _date_key(latest_nav.date)
-        trade_date = context["trade_date"]
-        if not context["is_final"] or latest_nav_date != trade_date:
+        if not target_trade_date or not self._is_final_target(context, target_trade_date):
             return None
 
-        previous_nav = self._previous_nav(fund_code, trade_date)
+        target_nav = self._published_nav_for_target(fund_code, latest_nav, target_trade_date)
+        if target_nav is None:
+            return None
+
+        target_nav_date = _date_key(target_nav.date)
+        previous_nav = self._previous_nav(fund_code, target_trade_date)
         growth_pct = None
         if previous_nav is not None and previous_nav.nav > 0:
-            growth_pct = (latest_nav.nav / previous_nav.nav - 1) * 100
+            growth_pct = (target_nav.nav / previous_nav.nav - 1) * 100
 
         result = {
             "code": fund_code,
             "name": fund_name or f"基金{fund_code}",
             "status": "estimated",
             "source": "nav",
-            "estimate_nav": round(float(latest_nav.nav), 6),
+            "estimate_nav": round(float(target_nav.nav), 6),
             "estimate_growth_pct": round(growth_pct, 4) if growth_pct is not None else None,
             "coverage_pct": 100.0,
             "confidence": 100.0,
             "reason": None,
             "latest_nav": round(float(previous_nav.nav), 6) if previous_nav is not None else None,
             "latest_nav_date": previous_nav.date if previous_nav is not None else None,
-            "actual_nav": round(float(latest_nav.nav), 6),
-            "actual_nav_date": latest_nav.date,
+            "actual_nav": round(float(target_nav.nav), 6),
+            "actual_nav_date": target_nav.date,
             "estimate_time": None,
             "contributions": [],
         }
-        self._attach_valuation_context(result, context, trade_date=latest_nav_date)
+        self._attach_valuation_context(result, context, trade_date=target_nav_date)
         return result
+
+    def _published_nav_for_target(
+        self,
+        fund_code: str,
+        latest_nav: LatestNav | None,
+        target_trade_date: str,
+    ) -> LatestNav | None:
+        if latest_nav is None or latest_nav.nav <= 0:
+            return None
+        latest_nav_date = _date_key(latest_nav.date)
+        if latest_nav_date == target_trade_date:
+            return latest_nav
+        if not latest_nav_date or latest_nav_date < target_trade_date:
+            return None
+
+        by_date = getattr(self.provider, "get_nav_by_date", None)
+        if not callable(by_date):
+            return None
+        target_nav = self._safe_call(lambda: by_date(fund_code, target_trade_date))
+        if target_nav is None or target_nav.nav <= 0:
+            return None
+        if _date_key(target_nav.date) != target_trade_date:
+            return None
+        return target_nav
 
     def _actual_nav_for_snapshot(self, snapshot: dict) -> LatestNav | None:
         snapshot_date = _date_key(snapshot.get("snapshot_date"))
@@ -301,9 +346,23 @@ class FundValuationService:
         normalized = fund_name.upper()
         if "ETF联接" in fund_name or "ETF聯接" in fund_name:
             return 0.1
-        if "QDII" in normalized:
+        if _is_qdii_name(normalized):
             return 2.0
         return self.min_coverage_pct
+
+    def _target_trade_date(self, fund_name: str, context: dict) -> str:
+        context_trade_date = context["trade_date"]
+        if not _is_qdii_name(fund_name):
+            return context_trade_date
+        parsed = _parse_date_key(context_trade_date)
+        if parsed is None:
+            return context_trade_date
+        return self._latest_trading_date(parsed, include_current=False)
+
+    @staticmethod
+    def _is_final_target(context: dict, target_trade_date: str) -> bool:
+        context_trade_date = context["trade_date"]
+        return bool(context["is_final"] or (context_trade_date and target_trade_date < context_trade_date))
 
     def _valuation_context(self, current: datetime) -> dict:
         date_key = current.strftime("%Y-%m-%d")
@@ -345,6 +404,8 @@ class FundValuationService:
     ) -> None:
         effective_trade_date = self._normalize_trade_date(_date_key(trade_date), context)
         result["trade_date"] = effective_trade_date
+        result["target_trade_date"] = effective_trade_date
+        result["context_trade_date"] = context["trade_date"]
         result["market_phase"] = context["market_phase"]
         result["is_final"] = context["is_final"]
         if effective_trade_date and effective_trade_date < context["trade_date"]:
@@ -420,6 +481,8 @@ class FundValuationService:
         result["snapshot_key"] = snapshot_key
         result["snapshot_date"] = context["trade_date"]
         result["trade_date"] = _date_key(result.get("trade_date")) or context["trade_date"]
+        result["target_trade_date"] = result["trade_date"]
+        result["context_trade_date"] = context["trade_date"]
         result["market_phase"] = context["market_phase"]
         result["is_final"] = True
         return result
@@ -443,6 +506,8 @@ class FundValuationService:
             "snapshot_key": snapshot_key,
             "snapshot_date": context["trade_date"],
             "trade_date": context["trade_date"],
+            "target_trade_date": context["trade_date"],
+            "context_trade_date": context["trade_date"],
             "market_phase": context["market_phase"],
             "is_final": True,
         }
@@ -536,6 +601,10 @@ def _quote_trade_date(quotes: dict[str, Quote]) -> str:
     if not counts:
         return ""
     return max(counts.items(), key=lambda item: (item[1], item[0]))[0]
+
+
+def _is_qdii_name(fund_name: str) -> bool:
+    return "QDII" in str(fund_name or "").upper()
 
 
 def _is_usable_snapshot_row(row: dict) -> bool:
