@@ -400,6 +400,7 @@ function renderFundTable(items, withDelete, showActualGrowth = false) {
         ${showActualGrowth ? "<span>净值涨跌幅</span>" : ""}
         <span>覆盖率</span>
         <span>置信度</span>
+        <span>说明</span>
         <span>来源</span>
         <span></span>
       </div>
@@ -416,8 +417,7 @@ function renderFund(item, withDelete, showActualGrowth = false) {
   const displayName = item.alias || item.name || item.code;
   const actualNav = actualNavValue(item);
   const actualNavDate = navDateLabel(item);
-  const factorNote = factorFitLabel(item);
-  const driftNote = styleDriftLabel(item);
+  const explanationItems = estimateExplanationItems(item);
   const meta = [
     item.code,
     item.alias && item.name ? item.name : null,
@@ -442,7 +442,6 @@ function renderFund(item, withDelete, showActualGrowth = false) {
       <div>
         <span class="cell-label">估算涨跌</span>
         <div class="value ${growthClass}">${formatPercent(item.estimate_growth_pct)}</div>
-        ${factorNote ? `<span class="cell-note">${escapeHtml(factorNote)}</span>` : ""}
       </div>
       ${showActualGrowth ? `
       <div>
@@ -456,7 +455,12 @@ function renderFund(item, withDelete, showActualGrowth = false) {
       <div>
         <span class="cell-label">置信度</span>
         <div class="value">${formatPercent(item.confidence)}</div>
-        ${driftNote ? `<span class="cell-note">${escapeHtml(driftNote)}</span>` : ""}
+      </div>
+      <div class="fund-explanation">
+        <span class="cell-label">说明</span>
+        ${explanationItems.length ? explanationItems.map((note) => `
+          <span class="cell-note ${note.className}">${escapeHtml(note.text)}</span>
+        `).join("") : `<span class="cell-note">--</span>`}
       </div>
       <div>
         <span class="source-tag ${sourceClass}">${escapeHtml(sourceText)}</span>
@@ -493,6 +497,14 @@ function sourceLabel(item) {
   return labels[item.source] || item.source || item.status || "";
 }
 
+function estimateExplanationItems(item) {
+  return [
+    { text: estimateRiskLabel(item), className: "risk-note" },
+    { text: factorFitLabel(item), className: "" },
+    { text: styleDriftLabel(item), className: "" },
+  ].filter((note) => note.text);
+}
+
 function factorFitLabel(item) {
   const growth = typeof item.fit_growth_pct === "number" ? item.fit_growth_pct : (
     item.source === "factor_fit" ? item.estimate_growth_pct : null
@@ -514,6 +526,33 @@ function styleDriftLabel(item) {
     high: "高",
   }[item.style_drift_level] || item.style_drift_level || "低";
   return `风格漂移 ${level} ${item.style_drift_score.toFixed(1)}`;
+}
+
+function estimateRiskLabel(item) {
+  if (item.source !== "holding" || !item.estimate_risk_level) {
+    return null;
+  }
+  const level = {
+    low: "低",
+    medium: "中",
+    high: "高",
+  }[item.estimate_risk_level] || item.estimate_risk_level;
+  const details = [];
+  if (Array.isArray(item.estimate_risk_reasons)) {
+    item.estimate_risk_reasons.map(estimateRiskReasonLabel).filter(Boolean).forEach((label) => details.push(label));
+  }
+  if (typeof item.uncovered_weight_pct === "number" && item.uncovered_proxy_source === "factor_fit") {
+    details.push(`未覆盖仓位 ${formatPercent(item.uncovered_weight_pct)} 用指数拟合`);
+  }
+  return `估值风险 ${level}${details.length ? ` · ${details.join(" · ")}` : ""}`;
+}
+
+function estimateRiskReasonLabel(reason) {
+  return {
+    low_coverage: "覆盖率低",
+    medium_coverage: "覆盖率偏低",
+    volatile_holdings: "持仓波动大",
+  }[reason] || "";
 }
 
 function percentClass(value) {

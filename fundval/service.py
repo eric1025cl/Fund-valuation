@@ -19,6 +19,7 @@ from .valuation import (
 
 SNAPSHOT_REPAIR_INTERVAL = timedelta(minutes=10)
 RECONCILIATION_RETRY_INTERVAL = timedelta(minutes=30)
+SNAPSHOT_SAVE_MINUTE = 15 * 60 + 5
 
 
 class FundDataProvider(Protocol):
@@ -157,6 +158,8 @@ class FundValuationService:
             )
             return self._with_calibrated_confidence(fund_code, factor_data)
 
+        self._blend_uncovered_holding_estimate(result, factor_result)
+        self._attach_holding_estimate_risk(result)
         self._attach_factor_monitoring(result, factor_result)
         result.update(
             {
@@ -190,7 +193,8 @@ class FundValuationService:
         current = now or datetime.now()
         if not self._is_trading_day(current):
             return None
-        if current.hour < 15:
+        minutes = current.hour * 60 + current.minute
+        if minutes < SNAPSHOT_SAVE_MINUTE:
             return None
         key = current.strftime("%Y-%m-%d 15:00")
         if self.store.has_snapshot(key):
@@ -356,6 +360,91 @@ class FundValuationService:
                 "style_drift_reason": factor_data.get("style_drift_reason"),
             }
         )
+
+    @staticmethod
+    def _blend_uncovered_holding_estimate(result: dict, factor_result) -> None:
+        if result.get("status") != "estimated" or result.get("source") != "holding":
+            return
+        if factor_result is None or getattr(factor_result, "status", None) != "estimated":
+            return
+
+        factor_data = factor_result.to_dict()
+        proxy_growth = _number_or_none(factor_data.get("estimate_growth_pct"))
+        coverage = _number_or_none(result.get("coverage_pct"))
+        latest_nav = _number_or_none(result.get("latest_nav"))
+        if proxy_growth is None or coverage is None or latest_nav is None or latest_nav <= 0:
+            return
+        if coverage <= 0 or coverage >= 99.999:
+            return
+
+        contributions = result.get("contributions") or []
+        covered_contribution = sum(
+            _number_or_zero(item.get("contribution_pct"))
+            for item in contributions
+            if isinstance(item, dict)
+        )
+        uncovered_weight = max(0.0, 100.0 - min(coverage, 100.0))
+        if uncovered_weight <= 0:
+            return
+
+        raw_growth = _number_or_none(result.get("estimate_growth_pct"))
+        blended_growth = covered_contribution + proxy_growth * uncovered_weight / 100.0
+        result["raw_holding_estimate_nav"] = result.get("estimate_nav")
+        result["raw_holding_estimate_growth_pct"] = round(raw_growth, 4) if raw_growth is not None else None
+        result["covered_contribution_pct"] = round(covered_contribution, 4)
+        result["uncovered_weight_pct"] = round(uncovered_weight, 4)
+        result["uncovered_proxy_source"] = "factor_fit"
+        result["uncovered_proxy_growth_pct"] = round(proxy_growth, 4)
+        result["estimate_growth_pct"] = round(blended_growth, 4)
+        result["estimate_nav"] = round(latest_nav * (1 + blended_growth / 100.0), 6)
+
+    @staticmethod
+    def _attach_holding_estimate_risk(result: dict) -> None:
+        if result.get("status") != "estimated" or result.get("source") != "holding":
+            return
+
+        coverage = _number_or_none(result.get("coverage_pct")) or 0.0
+        contributions = result.get("contributions") or []
+        weighted_abs_move = 0.0
+        max_abs_move = 0.0
+        for item in contributions:
+            if not isinstance(item, dict):
+                continue
+            weight = _number_or_none(item.get("weight_pct")) or 0.0
+            change = abs(_number_or_none(item.get("change_pct")) or 0.0)
+            weighted_abs_move += weight * change
+            max_abs_move = max(max_abs_move, change)
+        if coverage > 0:
+            weighted_abs_move /= coverage
+
+        level = "low"
+        reasons: list[str] = []
+        if coverage < 50.0:
+            level = "high"
+            reasons.append("low_coverage")
+        elif coverage < 65.0:
+            level = "medium"
+            reasons.append("medium_coverage")
+
+        if weighted_abs_move >= 5.0 or max_abs_move >= 10.0:
+            level = "high"
+            reasons.append("volatile_holdings")
+        elif weighted_abs_move >= 3.0 or max_abs_move >= 7.0:
+            if level == "low":
+                level = "medium"
+            reasons.append("volatile_holdings")
+
+        result["estimate_risk_level"] = level
+        result["estimate_risk_reasons"] = reasons
+        result["coverage_weighted_abs_move_pct"] = round(weighted_abs_move, 4)
+        result["max_holding_abs_move_pct"] = round(max_abs_move, 4)
+
+        confidence = _number_or_none(result.get("confidence"))
+        if confidence is None or level == "low":
+            return
+        multiplier = 0.75 if level == "high" else 0.9
+        result["pre_risk_confidence"] = round(confidence, 1)
+        result["confidence"] = round(min(95.0, max(0.0, confidence * multiplier)), 1)
 
     def _published_nav_for_target(
         self,
@@ -702,3 +791,17 @@ def _datetime_or_none(value) -> datetime | None:
         except ValueError:
             continue
     return None
+
+
+def _number_or_none(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _number_or_zero(value) -> float:
+    parsed = _number_or_none(value)
+    return parsed if parsed is not None else 0.0

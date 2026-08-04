@@ -444,6 +444,59 @@ class FundValuationServiceTests(unittest.TestCase):
         self.assertAlmostEqual(result["fit_r2"], 1.0, places=3)
         self.assertIn("factor_exposures", result)
 
+    def test_holding_estimate_blends_uncovered_weight_with_factor_fit(self):
+        class FactorBlendProvider(FakeProvider):
+            def get_nav_history(self, code, limit=120):
+                return factor_points(1.0, [1.0] * 24)
+
+            def get_factor_histories(self, limit=120):
+                return {
+                    "sh000300": factor_points(100.0, [1.0] * 24),
+                }
+
+            def get_factor_quotes(self, factor_codes):
+                return {"sh000300": Quote(code="sh000300", name="CSI 300", change_pct=1.2)}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=FactorBlendProvider())
+
+            result = service.estimate_fund("161725", now=TRADING_TIME)
+
+        self.assertEqual(result["source"], "holding")
+        self.assertAlmostEqual(result["raw_holding_estimate_growth_pct"], 0.8)
+        self.assertAlmostEqual(result["covered_contribution_pct"], 0.4)
+        self.assertAlmostEqual(result["uncovered_weight_pct"], 50.0)
+        self.assertEqual(result["uncovered_proxy_source"], "factor_fit")
+        self.assertAlmostEqual(result["uncovered_proxy_growth_pct"], 1.2)
+        self.assertAlmostEqual(result["estimate_growth_pct"], 1.0)
+        self.assertAlmostEqual(result["estimate_nav"], 1.01)
+
+    def test_holding_estimate_marks_high_risk_and_reduces_confidence_for_volatile_holdings(self):
+        class VolatileHoldingProvider(FakeProvider):
+            def get_holdings(self, code):
+                return [
+                    Holding(name="A", code="600519", weight_pct=40.0),
+                    Holding(name="B", code="000858", weight_pct=20.0),
+                ]
+
+            def get_quotes(self, stock_codes):
+                return {
+                    "600519": Quote(code="600519", name="A", change_pct=-12.0),
+                    "000858": Quote(code="000858", name="B", change_pct=-8.0),
+                }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=VolatileHoldingProvider())
+
+            result = service.estimate_fund("161725", now=TRADING_TIME)
+
+        self.assertEqual(result["estimate_risk_level"], "high")
+        self.assertIn("volatile_holdings", result["estimate_risk_reasons"])
+        self.assertAlmostEqual(result["pre_risk_confidence"], 60.0)
+        self.assertAlmostEqual(result["confidence"], 45.0)
+
     def test_holding_estimate_includes_factor_fit_monitoring_fields(self):
         class FactorMonitorProvider(FakeProvider):
             def get_nav_history(self, code, limit=120):
@@ -573,7 +626,8 @@ class FundValuationServiceTests(unittest.TestCase):
 
             result = service.estimate_fund("161725", now=TRADING_TIME)
 
-        self.assertEqual(result["base_confidence"], 50.0)
+        self.assertEqual(result["pre_risk_confidence"], 50.0)
+        self.assertEqual(result["base_confidence"], 45.0)
         self.assertGreater(result["confidence"], 50.0)
         self.assertEqual(result["confidence_profile"]["sample_count"], 30)
         self.assertAlmostEqual(result["raw_estimate_growth_pct"], 0.8)
@@ -615,17 +669,21 @@ class FundValuationServiceTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "estimated")
         self.assertAlmostEqual(rows[0]["estimate_growth_pct"], 0.8)
 
-    def test_due_snapshot_runs_once_after_15(self):
+    def test_due_snapshot_runs_once_after_1505(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = WatchlistStore(Path(temp_dir) / "funds.db")
             service = FundValuationService(store=store, provider=FakeProvider())
             service.add_fund("161725", "白酒")
 
             before = service.create_due_snapshot(datetime(2026, 7, 31, 14, 59, 0))
-            first = service.create_due_snapshot(datetime(2026, 7, 31, 15, 0, 0))
-            second = service.create_due_snapshot(datetime(2026, 7, 31, 15, 1, 0))
+            at_close = service.create_due_snapshot(datetime(2026, 7, 31, 15, 0, 0))
+            before_save = service.create_due_snapshot(datetime(2026, 7, 31, 15, 4, 59))
+            first = service.create_due_snapshot(datetime(2026, 7, 31, 15, 5, 0))
+            second = service.create_due_snapshot(datetime(2026, 7, 31, 15, 6, 0))
 
         self.assertIsNone(before)
+        self.assertIsNone(at_close)
+        self.assertIsNone(before_save)
         self.assertEqual(first["snapshot_key"], "2026-07-31 15:00")
         self.assertEqual(first["snapshot_date"], "2026-07-31")
         self.assertIsNone(second)
@@ -666,7 +724,7 @@ class FundValuationServiceTests(unittest.TestCase):
             service = FundValuationService(store=store, provider=CalendarProvider())
             service.add_fund("161725", "白酒")
 
-            trading_day = service.create_due_snapshot(datetime(2026, 7, 31, 15, 0, 0))
+            trading_day = service.create_due_snapshot(datetime(2026, 7, 31, 15, 5, 0))
             weekday_holiday = service.create_due_snapshot(datetime(2026, 8, 3, 15, 0, 0))
             status = service.trading_status(datetime(2026, 8, 3, 10, 0, 0))
 
