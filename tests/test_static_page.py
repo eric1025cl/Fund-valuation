@@ -1,4 +1,5 @@
 import unittest
+import re
 from pathlib import Path
 
 
@@ -48,6 +49,18 @@ class StaticPageTests(unittest.TestCase):
         self.assertIn("function isTradingRefreshWindow", js)
         self.assertIn("/api/trading-status", js)
         self.assertIn("document.hidden", js)
+
+    def test_auto_refresh_forces_live_valuation_refresh(self):
+        js = Path("web/app.js").read_text(encoding="utf-8")
+
+        match = re.search(
+            r"function startAutoRefresh\(\) \{\s*window\.setInterval\(async \(\) => \{(?P<body>.*?)\s*\}, AUTO_REFRESH_INTERVAL_MS\);",
+            js,
+            re.S,
+        )
+
+        self.assertIsNotNone(match)
+        self.assertIn("loadLive({ forceRefresh: true });", match.group("body"))
 
     def test_shows_reconciliation_controls_and_records(self):
         html = Path("web/index.html").read_text(encoding="utf-8")

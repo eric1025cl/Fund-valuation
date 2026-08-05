@@ -165,6 +165,20 @@ class BlockingRefreshProvider(FakeProvider):
         return LatestNav(nav=1.0, date="2026-07-30")
 
 
+class ChangingQuoteProvider(FakeProvider):
+    def __init__(self):
+        super().__init__()
+        self.change_pct = 1.0
+        self.quote_calls = 0
+
+    def get_quotes(self, stock_codes):
+        self.quote_calls += 1
+        return {
+            code: Quote(code=code, name=code, change_pct=self.change_pct)
+            for code in stock_codes
+        }
+
+
 class CountingFactorProvider(FakeProvider):
     def __init__(self):
         super().__init__()
@@ -305,6 +319,24 @@ class FundValuationServiceTests(unittest.TestCase):
 
         self.assertEqual(refreshed[0]["code"], "161725")
         self.assertEqual(refreshed[0]["source"], "holding")
+
+    def test_forced_cached_watchlist_returns_refreshed_rows(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            store.add_fund("161725", name="fund 161725")
+            provider = ChangingQuoteProvider()
+            service = FundValuationService(store=store, provider=provider)
+
+            first_rows = service.estimate_watchlist_cached(now=TRADING_TIME, force_refresh=True)
+            provider.change_pct = 3.0
+            cached_rows = service.estimate_watchlist_cached(now=TRADING_TIME)
+            refreshed_rows = service.estimate_watchlist_cached(now=TRADING_TIME, force_refresh=True)
+
+        self.assertEqual(len(first_rows), 1)
+        self.assertEqual(first_rows[0]["estimate_growth_pct"], 1.0)
+        self.assertEqual(cached_rows[0]["estimate_growth_pct"], 1.0)
+        self.assertEqual(refreshed_rows[0]["estimate_growth_pct"], 3.0)
+        self.assertEqual(provider.quote_calls, 2)
 
     def test_cached_watchlist_uses_current_close_snapshot_after_market_close(self):
         with tempfile.TemporaryDirectory() as temp_dir:

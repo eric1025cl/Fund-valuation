@@ -226,7 +226,7 @@ function startAutoRefresh() {
     if (state.view !== "live" || document.hidden || !(await shouldAutoRefreshNow(new Date()))) {
       return;
     }
-    loadLive();
+    loadLive({ forceRefresh: true });
   }, AUTO_REFRESH_INTERVAL_MS);
 }
 

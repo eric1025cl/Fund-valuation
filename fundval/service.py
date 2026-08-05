@@ -109,6 +109,17 @@ class FundValuationService:
             if self.store.has_snapshot(self._previous_close_snapshot_key(context)):
                 return self._snapshot_estimates_for_funds(funds, context, current)
 
+        if force_refresh:
+            with self._watchlist_cache_lock:
+                self._watchlist_cache_generation += 1
+                refresh_generation = self._watchlist_cache_generation
+            rows = self._estimate_live_watchlist_with_timeout(current)
+            with self._watchlist_cache_lock:
+                if refresh_generation == self._watchlist_cache_generation:
+                    self._watchlist_cache = _copy_result_rows(rows)
+                    self._watchlist_cache_at = datetime.now()
+            return _copy_result_rows(rows)
+
         wall_clock = datetime.now()
         should_refresh = False
         refresh_generation = 0
