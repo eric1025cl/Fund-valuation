@@ -30,7 +30,7 @@ class StaticPageTests(unittest.TestCase):
         self.assertIn("每个交易日 15:05 自动保存", html)
         self.assertNotIn("每个交易日 15:00 自动保存", html)
         self.assertIn("估值交易日", html)
-        self.assertIn("快照日期", html)
+        self.assertNotIn("快照日期</span>", html)
         self.assertIn("实际净值", js)
         self.assertIn("净值涨跌幅", js)
         self.assertIn("估值日", js)
@@ -99,15 +99,18 @@ class StaticPageTests(unittest.TestCase):
         self.assertIn("function loadReconciliations", js)
         self.assertIn("function renderReconciliations", js)
 
-    def test_snapshot_cards_have_physical_delete_control(self):
+    def test_snapshot_select_has_physical_delete_control(self):
+        html = Path("web/index.html").read_text(encoding="utf-8")
         js = Path("web/app.js").read_text(encoding="utf-8")
         css = Path("web/styles.css").read_text(encoding="utf-8")
 
-        self.assertIn("data-delete-snapshot", js)
+        self.assertIn("deleteSelectedSnapshotButton", html)
+        self.assertIn("snapshotSelect", html)
         self.assertIn("async function deleteSnapshot", js)
+        self.assertIn("deleteSnapshot(state.selectedSnapshotKey)", js)
         self.assertIn("method: \"DELETE\"", js)
         self.assertIn("/api/snapshots/", js)
-        self.assertIn(".snapshot-delete-button", css)
+        self.assertIn(".snapshot-delete-selected", css)
 
     def test_shows_estimate_notes_in_dedicated_column(self):
         js = Path("web/app.js").read_text(encoding="utf-8")
@@ -124,6 +127,32 @@ class StaticPageTests(unittest.TestCase):
         self.assertIn("汇率", js)
         self.assertIn(".fund-explanation", css)
         self.assertIn("white-space: normal", css)
+
+    def test_snapshot_rows_show_quality_notes(self):
+        js = Path("web/app.js").read_text(encoding="utf-8")
+        css = Path("web/styles.css").read_text(encoding="utf-8")
+
+        self.assertIn("function snapshotQualityLabel", js)
+        self.assertIn("快照需重算", js)
+        self.assertIn("低覆盖估算", js)
+        self.assertIn("captured_at", js)
+        self.assertIn("snapshot-quality-note", css)
+
+    def test_snapshot_batches_use_compact_select_control(self):
+        html = Path("web/index.html").read_text(encoding="utf-8")
+        js = Path("web/app.js").read_text(encoding="utf-8")
+        css = Path("web/styles.css").read_text(encoding="utf-8")
+
+        self.assertIn("snapshotSelect", html)
+        self.assertIn("snapshotToolbar", html)
+        self.assertIn("function renderSnapshotOptions", js)
+        self.assertIn("function snapshotTradeDateLabel", js)
+        self.assertIn("多交易日", js)
+        self.assertIn("item.snapshot_key", js)
+        self.assertNotIn("snapshot_chip", js)
+        self.assertNotIn("snapshot-chip", js)
+        self.assertIn(".snapshot-toolbar", css)
+        self.assertIn(".snapshot-select", css)
 
     def test_fund_table_fits_page_without_horizontal_scroll(self):
         css = Path("web/styles.css").read_text(encoding="utf-8")

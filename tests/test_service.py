@@ -418,7 +418,7 @@ class FundValuationServiceTests(unittest.TestCase):
         self.assertGreater(provider.nav_history_calls, 0)
 
     def test_cached_watchlist_populates_timeout_rows_when_live_refresh_is_slow(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             store = WatchlistStore(Path(temp_dir) / "funds.db")
             store.add_fund("161725", name="fund 161725")
             provider = BlockingRefreshProvider()
@@ -1108,7 +1108,7 @@ class FundValuationServiceTests(unittest.TestCase):
             service.add_fund("161725", "stale")
             store.save_snapshot(
                 "2026-07-31 15:00",
-                "2026-07-31 15:00:00",
+                "2026-07-31 15:05:00",
                 [
                     {
                         "code": "161725",
@@ -1127,14 +1127,126 @@ class FundValuationServiceTests(unittest.TestCase):
                 ],
             )
 
-            too_soon = service.create_due_snapshot(datetime(2026, 7, 31, 15, 9, 59))
-            repaired = service.create_due_snapshot(datetime(2026, 7, 31, 15, 10, 0))
+            too_soon = service.create_due_snapshot(datetime(2026, 7, 31, 15, 14, 59))
+            repaired = service.create_due_snapshot(datetime(2026, 7, 31, 15, 15, 0))
             rows = service.get_snapshot("2026-07-31 15:00")
 
         self.assertIsNone(too_soon)
         self.assertEqual(repaired["snapshot_key"], "2026-07-31 15:00")
         self.assertEqual(rows[0]["status"], "estimated")
         self.assertAlmostEqual(rows[0]["estimate_growth_pct"], 0.8)
+
+    def test_manual_snapshot_before_1505_uses_intraday_key(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=FakeProvider())
+            service.add_fund("161725", "白酒")
+
+            snapshot = service.create_snapshot(now=datetime(2026, 7, 31, 15, 3, 23))
+            intraday_rows = service.get_snapshot("2026-07-31 15:03:23")
+            close_rows = service.get_snapshot("2026-07-31 15:00")
+
+        self.assertEqual(snapshot["snapshot_key"], "2026-07-31 15:03:23")
+        self.assertEqual(len(intraday_rows), 1)
+        self.assertEqual(close_rows, [])
+
+    def test_due_snapshot_replaces_premature_close_snapshot_after_1505(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=FakeProvider())
+            service.add_fund("161725", "白酒")
+            store.save_snapshot(
+                "2026-07-31 15:00",
+                "2026-07-31 15:00:19",
+                [
+                    {
+                        "code": "161725",
+                        "name": "stale",
+                        "status": "estimated",
+                        "source": "holding",
+                        "estimate_nav": 1.09,
+                        "estimate_growth_pct": 9.0,
+                        "coverage_pct": 0.11,
+                        "confidence": 20.0,
+                        "latest_nav": 1.0,
+                        "latest_nav_date": "2026-07-30",
+                        "contributions": [],
+                    }
+                ],
+            )
+
+            repaired = service.create_due_snapshot(datetime(2026, 7, 31, 15, 5, 0))
+            rows = service.get_snapshot("2026-07-31 15:00")
+
+        self.assertEqual(repaired["snapshot_key"], "2026-07-31 15:00")
+        self.assertAlmostEqual(rows[0]["estimate_growth_pct"], 0.8)
+        self.assertEqual(rows[0]["captured_at"], "2026-07-31 15:05:00")
+        self.assertEqual(rows[0]["snapshot_quality"], "normal")
+
+    def test_due_snapshot_repairs_legacy_low_coverage_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=FakeProvider())
+            service.add_fund("161725", "白酒")
+            store.save_snapshot(
+                "2026-07-31 15:00",
+                "2026-07-31 15:05:00",
+                [
+                    {
+                        "code": "161725",
+                        "name": "legacy",
+                        "status": "estimated",
+                        "source": "holding",
+                        "estimate_nav": 1.09,
+                        "estimate_growth_pct": 9.0,
+                        "coverage_pct": 0.11,
+                        "confidence": 20.0,
+                        "latest_nav": 1.0,
+                        "latest_nav_date": "2026-07-30",
+                        "contributions": [],
+                    }
+                ],
+            )
+
+            repaired = service.create_due_snapshot(datetime(2026, 7, 31, 15, 6, 0))
+            rows = service.get_snapshot("2026-07-31 15:00")
+
+        self.assertEqual(repaired["snapshot_key"], "2026-07-31 15:00")
+        self.assertAlmostEqual(rows[0]["estimate_growth_pct"], 0.8)
+        self.assertEqual(rows[0]["snapshot_quality"], "normal")
+
+    def test_snapshot_detail_marks_current_low_coverage_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=FakeProvider())
+            store.save_snapshot(
+                "2026-07-31 15:00",
+                "2026-07-31 15:05:00",
+                [
+                    {
+                        "code": "161725",
+                        "name": "current low coverage",
+                        "status": "estimated",
+                        "source": "holding",
+                        "estimate_nav": 1.02,
+                        "estimate_growth_pct": 2.0,
+                        "coverage_pct": 0.11,
+                        "confidence": 15.0,
+                        "latest_nav": 1.0,
+                        "latest_nav_date": "2026-07-30",
+                        "trade_date": "2026-07-31",
+                        "target_trade_date": "2026-07-31",
+                        "context_trade_date": "2026-07-31",
+                        "estimate_risk_level": "high",
+                        "estimate_risk_reasons": ["low_coverage"],
+                    }
+                ],
+            )
+
+            rows = service.get_snapshot("2026-07-31 15:00")
+
+        self.assertEqual(rows[0]["snapshot_quality"], "low_coverage")
+        self.assertIn("low_coverage", rows[0]["snapshot_quality_reasons"])
 
     def test_due_snapshot_runs_once_after_1505(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -330,7 +330,7 @@ class WatchlistStore:
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 """
-                SELECT payload_json
+                SELECT captured_at, payload_json
                 FROM valuation_snapshots
                 WHERE snapshot_key = ?
                 ORDER BY code ASC
@@ -340,6 +340,8 @@ class WatchlistStore:
         result = []
         for row in rows:
             item = json.loads(row["payload_json"])
+            item["snapshot_key"] = clean_key
+            item["captured_at"] = row["captured_at"]
             item["snapshot_date"] = _item_snapshot_date(item, clean_key, item.get("captured_at", ""))
             result.append(item)
         return result

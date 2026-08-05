@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>基金估值看板</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260804-risk" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260805-snapshot-select" />
   </head>
   <body>
     <main class="shell">
@@ -76,7 +76,7 @@
             <strong id="selectedSnapshot">--</strong>
           </div>
           <div class="metric">
-            <span>快照日期</span>
+            <span>估值交易日</span>
             <strong id="snapshotDate">--</strong>
           </div>
           <div class="metric">
@@ -84,7 +84,13 @@
             <strong id="snapshotFundCount">0</strong>
           </div>
         </section>
-        <div id="snapshotList" class="snapshot-list" aria-label="快照批次"></div>
+        <div id="snapshotToolbar" class="snapshot-toolbar" aria-label="快照批次">
+          <label class="snapshot-selector">
+            <span>选择批次</span>
+            <select id="snapshotSelect" class="snapshot-select"></select>
+          </label>
+          <button id="deleteSelectedSnapshotButton" class="snapshot-delete-selected" type="button">删除当前快照</button>
+        </div>
         <section id="snapshotDetail" class="fund-list" aria-label="快照明细"></section>
         <section class="reconciliation-panel" aria-label="校准对账记录">
           <div class="section-head">
@@ -99,6 +105,6 @@
 
       <p class="disclaimer">估值基于公开数据和披露持仓，仅供参考，不构成投资建议。交易日 9:00-15:05 页面打开时每 10 分钟自动刷新；非交易日优先使用上一交易日 15:00 估值快照，没有快照则重新计算；每个交易日 15:05 自动保存一份带日期标记的估值快照。</p>
     </main>
-    <script src="/static/app.js?v=20260805-refresh-visible"></script>
+    <script src="/static/app.js?v=20260805-snapshot-select"></script>
   </body>
 </html>

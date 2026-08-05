@@ -419,7 +419,7 @@ class FundValuationService:
         return self.store.list_snapshots()
 
     def get_snapshot(self, snapshot_key: str) -> list[dict]:
-        return self.store.get_snapshot(snapshot_key)
+        return [self._attach_snapshot_quality(row) for row in self.store.get_snapshot(snapshot_key)]
 
     def delete_snapshot(self, snapshot_key: str) -> int:
         deleted = self.store.delete_snapshot(snapshot_key)
@@ -793,12 +793,56 @@ class FundValuationService:
 
     def _should_repair_snapshot(self, snapshot_key: str, current: datetime) -> bool:
         rows = self.store.get_snapshot(snapshot_key)
-        if not rows or not _snapshot_has_incomplete(rows):
+        if not rows:
             return False
         captured_at = _snapshot_captured_at(self.store.list_snapshots(), snapshot_key)
+        if _is_premature_close_snapshot(snapshot_key, captured_at):
+            return True
+        if self._snapshot_has_legacy_quality_gap(rows):
+            return True
+        if not _snapshot_has_incomplete(rows):
+            return False
         if captured_at is None:
             return True
         return current - captured_at >= SNAPSHOT_REPAIR_INTERVAL
+
+    def _snapshot_has_legacy_quality_gap(self, rows: list[dict]) -> bool:
+        for row in rows:
+            if row.get("status") != "estimated" or row.get("source") != "holding":
+                continue
+            if _number_or_none(row.get("coverage_pct")) is None:
+                continue
+            if not row.get("target_trade_date") or not row.get("context_trade_date"):
+                return True
+            if (
+                _number_or_none(row.get("coverage_pct")) < self.min_coverage_pct
+                and not row.get("estimate_risk_level")
+            ):
+                return True
+        return False
+
+    def _attach_snapshot_quality(self, row: dict) -> dict:
+        result = dict(row)
+        reasons: list[str] = []
+        if _is_premature_close_snapshot(result.get("snapshot_key"), result.get("captured_at")):
+            reasons.append("captured_before_close_save_time")
+        if result.get("status") == "estimated" and result.get("source") == "holding":
+            coverage = _number_or_none(result.get("coverage_pct"))
+            if coverage is not None and coverage < self.min_coverage_pct:
+                reasons.append("low_coverage")
+                if not result.get("estimate_risk_level"):
+                    reasons.append("legacy_quality_fields")
+            if not result.get("target_trade_date") or not result.get("context_trade_date"):
+                reasons.append("legacy_quality_fields")
+
+        if "captured_before_close_save_time" in reasons or "legacy_quality_fields" in reasons:
+            result["snapshot_quality"] = "needs_recompute"
+        elif "low_coverage" in reasons:
+            result["snapshot_quality"] = "low_coverage"
+        else:
+            result["snapshot_quality"] = "normal"
+        result["snapshot_quality_reasons"] = sorted(set(reasons))
+        return result
 
     def _coverage_floor(self, fund_name: str) -> float:
         normalized = fund_name.upper()
@@ -872,6 +916,8 @@ class FundValuationService:
 
     def _default_snapshot_key(self, current: datetime) -> str:
         context = self._valuation_context(current)
+        if context["is_trading_day"] and 15 * 60 <= current.hour * 60 + current.minute < SNAPSHOT_SAVE_MINUTE:
+            return current.strftime("%Y-%m-%d %H:%M:%S")
         if context["is_final"] and context["trade_date"]:
             return f"{context['trade_date']} 15:00"
         return current.strftime("%Y-%m-%d %H:%M")
@@ -1129,6 +1175,21 @@ def _datetime_or_none(value) -> datetime | None:
         except ValueError:
             continue
     return None
+
+
+def _is_premature_close_snapshot(snapshot_key, captured_at) -> bool:
+    key_text = str(snapshot_key or "").strip()
+    if len(key_text) != 16:
+        return False
+    key_time = _datetime_or_none(snapshot_key)
+    captured_time = _datetime_or_none(captured_at)
+    if key_time is None or captured_time is None:
+        return False
+    if key_time.hour * 60 + key_time.minute != 15 * 60:
+        return False
+    if key_time.date() != captured_time.date():
+        return False
+    return captured_time.hour * 60 + captured_time.minute < SNAPSHOT_SAVE_MINUTE
 
 
 def _number_or_none(value) -> float | None:

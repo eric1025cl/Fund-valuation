@@ -32,7 +32,8 @@ const snapshotCount = document.querySelector("#snapshotCount");
 const selectedSnapshot = document.querySelector("#selectedSnapshot");
 const snapshotDate = document.querySelector("#snapshotDate");
 const snapshotFundCount = document.querySelector("#snapshotFundCount");
-const snapshotList = document.querySelector("#snapshotList");
+const snapshotSelect = document.querySelector("#snapshotSelect");
+const deleteSelectedSnapshotButton = document.querySelector("#deleteSelectedSnapshotButton");
 const snapshotDetail = document.querySelector("#snapshotDetail");
 const reconciliationStatus = document.querySelector("#reconciliationStatus");
 const reconciliationList = document.querySelector("#reconciliationList");
@@ -115,6 +116,15 @@ reconcileButton.addEventListener("click", async () => {
   } finally {
     reconcileButton.disabled = false;
   }
+});
+
+snapshotSelect.addEventListener("change", async () => {
+  state.selectedSnapshotKey = snapshotSelect.value || null;
+  await loadSnapshots();
+});
+
+deleteSelectedSnapshotButton.addEventListener("click", async () => {
+  await deleteSnapshot(state.selectedSnapshotKey);
 });
 
 async function loadLive(options = {}) {
@@ -332,45 +342,38 @@ function liveTradeDate(rows) {
 }
 
 function renderSnapshots() {
-  const selected = state.snapshots.find((item) => item.snapshot_key === state.selectedSnapshotKey);
   snapshotCount.textContent = String(state.snapshots.length);
   selectedSnapshot.textContent = state.selectedSnapshotKey || "--";
-  snapshotDate.textContent = selected?.snapshot_date || state.snapshotRows[0]?.snapshot_date || "--";
+  snapshotDate.textContent = snapshotTradeDateLabel(state.snapshotRows);
   snapshotFundCount.textContent = String(state.snapshotRows.length);
+  renderSnapshotOptions();
 
   if (!state.snapshots.length) {
-    snapshotList.innerHTML = "";
     snapshotDetail.innerHTML = `<div class="empty">暂无快照数据</div>`;
     renderReconciliations();
     return;
   }
 
-  snapshotList.innerHTML = state.snapshots
-    .map((item) => `
-      <div class="snapshot-chip-wrap">
-        <button class="snapshot-chip ${item.snapshot_key === state.selectedSnapshotKey ? "active" : ""}" data-snapshot="${escapeHtml(item.snapshot_key)}">
-          <strong>${escapeHtml(item.snapshot_date || item.snapshot_key)}</strong>
-          <span>${item.count} 只基金 · ${escapeHtml(item.snapshot_key)}</span>
-        </button>
-        <button class="snapshot-delete-button" data-delete-snapshot="${escapeHtml(item.snapshot_key)}" type="button" title="删除快照" aria-label="删除快照">&times;</button>
-      </div>
-    `)
-    .join("");
-
-  document.querySelectorAll("[data-snapshot]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      state.selectedSnapshotKey = button.dataset.snapshot;
-      await loadSnapshots();
-    });
-  });
-  document.querySelectorAll("[data-delete-snapshot]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      await deleteSnapshot(button.dataset.deleteSnapshot);
-    });
-  });
-
   snapshotDetail.innerHTML = renderFundTable(state.snapshotRows, false, true);
   renderReconciliations();
+}
+
+function renderSnapshotOptions() {
+  snapshotSelect.disabled = !state.snapshots.length;
+  deleteSelectedSnapshotButton.disabled = !state.selectedSnapshotKey;
+  snapshotSelect.innerHTML = state.snapshots
+    .map((item) => `
+      <option value="${escapeHtml(item.snapshot_key)}">
+        ${escapeHtml(snapshotOptionLabel(item))}
+      </option>
+    `)
+    .join("");
+  snapshotSelect.value = state.selectedSnapshotKey || "";
+}
+
+function snapshotOptionLabel(item) {
+  const count = typeof item.count === "number" ? `${item.count} 只基金` : "基金数量未知";
+  return `${item.snapshot_key} · ${formatCapturedAt(item.captured_at)} · ${count}`;
 }
 
 async function deleteSnapshot(snapshotKey) {
@@ -567,11 +570,22 @@ function sourceLabel(item) {
 
 function estimateExplanationItems(item) {
   return [
+    { text: snapshotQualityLabel(item), className: "snapshot-quality-note" },
     { text: estimateRiskLabel(item), className: "risk-note" },
     { text: qdiiBenchmarkLabel(item), className: "" },
     { text: factorFitLabel(item), className: "" },
     { text: styleDriftLabel(item), className: "" },
   ].filter((note) => note.text);
+}
+
+function snapshotQualityLabel(item) {
+  if (item.snapshot_quality === "needs_recompute") {
+    return "快照需重算：早保存或旧口径";
+  }
+  if (item.snapshot_quality === "low_coverage") {
+    return "低覆盖估算：仅方向参考";
+  }
+  return null;
 }
 
 function qdiiBenchmarkLabel(item) {
@@ -670,6 +684,18 @@ function formatNumber(value, digits) {
 
 function formatPercent(value) {
   return typeof value === "number" ? `${value.toFixed(2)}%` : "--";
+}
+
+function formatCapturedAt(value) {
+  return value ? `保存 ${value}` : "保存时间未知";
+}
+
+function snapshotTradeDateLabel(rows) {
+  const dates = [...new Set((rows || []).map((item) => item.trade_date || item.target_trade_date || item.snapshot_date).filter(Boolean))];
+  if (!dates.length) {
+    return "--";
+  }
+  return dates.length === 1 ? dates[0] : "多交易日";
 }
 
 function formatTradeContext(item) {

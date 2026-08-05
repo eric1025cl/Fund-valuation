@@ -193,58 +193,35 @@ input {
   color: var(--text);
 }
 
-.snapshot-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+.snapshot-toolbar {
+  display: grid;
+  grid-template-columns: minmax(280px, 1fr) auto;
+  gap: 10px;
+  align-items: end;
   margin-bottom: 12px;
 }
 
-.snapshot-chip-wrap {
-  position: relative;
-}
-
-.snapshot-chip {
-  min-height: 42px;
-  width: 100%;
-  padding: 7px 30px 7px 12px;
-  text-align: left;
-}
-
-.snapshot-chip strong,
-.snapshot-chip span {
-  display: block;
-}
-
-.snapshot-chip span {
-  margin-top: 2px;
+.snapshot-selector {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
   color: var(--muted);
   font-size: 12px;
 }
 
-.snapshot-chip.active {
-  border-color: var(--accent);
-  background: #e8eef8;
+.snapshot-select {
+  width: 100%;
+  min-height: 36px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
 }
 
-.snapshot-delete-button {
-  position: absolute;
-  top: 4px;
-  right: 4px;
-  width: 18px;
-  height: 18px;
-  border: 1px solid transparent;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--muted);
-  line-height: 14px;
-  cursor: pointer;
-}
-
-.snapshot-delete-button:hover {
-  border-color: #f0b4ad;
-  background: #fff1f0;
-  color: #c0392b;
+.snapshot-delete-selected {
+  min-height: 36px;
 }
 
 .section-head {
@@ -387,6 +364,10 @@ input {
   color: var(--warning);
 }
 
+.snapshot-quality-note {
+  color: var(--warning);
+}
+
 .value {
   font-weight: 700;
   line-height: 1.25;
@@ -466,6 +447,11 @@ input {
 
   .top-actions {
     flex-shrink: 0;
+  }
+
+  .snapshot-toolbar {
+    grid-template-columns: 1fr;
+    align-items: stretch;
   }
 
   .fund-head {
