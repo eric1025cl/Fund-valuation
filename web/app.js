@@ -221,15 +221,6 @@ function isTradingRefreshWindow(date) {
   return day >= 1 && day <= 5 && minutes >= 9 * 60 && minutes <= AUTO_REFRESH_END_MINUTE;
 }
 
-function startAutoRefresh() {
-  window.setInterval(async () => {
-    if (state.view !== "live" || document.hidden || !(await shouldAutoRefreshNow(new Date()))) {
-      return;
-    }
-    loadLive({ forceRefresh: true });
-  }, AUTO_REFRESH_INTERVAL_MS);
-}
-
 async function shouldAutoRefreshNow(date) {
   if (!isTradingRefreshWindow(date)) {
     return false;
@@ -241,6 +232,25 @@ async function shouldAutoRefreshNow(date) {
   } catch (error) {
     return true;
   }
+}
+
+async function refreshLiveWhenAllowed() {
+  if (state.view !== "live" || !(await shouldAutoRefreshNow(new Date()))) {
+    return;
+  }
+  loadLive({ forceRefresh: true });
+}
+
+function startAutoRefresh() {
+  window.setInterval(async () => {
+    await refreshLiveWhenAllowed();
+  }, AUTO_REFRESH_INTERVAL_MS);
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) {
+      refreshLiveWhenAllowed();
+    }
+  });
 }
 
 function renderHealth(health) {

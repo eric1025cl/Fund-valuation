@@ -59,8 +59,34 @@ class StaticPageTests(unittest.TestCase):
             re.S,
         )
 
+        helper = re.search(
+            r"async function refreshLiveWhenAllowed\(\) \{(?P<body>.*?)\n\}",
+            js,
+            re.S,
+        )
+
         self.assertIsNotNone(match)
-        self.assertIn("loadLive({ forceRefresh: true });", match.group("body"))
+        self.assertIsNotNone(helper)
+        self.assertIn("refreshLiveWhenAllowed();", match.group("body"))
+        self.assertIn("loadLive({ forceRefresh: true });", helper.group("body"))
+
+    def test_auto_refresh_does_not_skip_hidden_open_pages(self):
+        js = Path("web/app.js").read_text(encoding="utf-8")
+
+        match = re.search(
+            r"function startAutoRefresh\(\) \{\s*window\.setInterval\(async \(\) => \{(?P<body>.*?)\s*\}, AUTO_REFRESH_INTERVAL_MS\);",
+            js,
+            re.S,
+        )
+
+        self.assertIsNotNone(match)
+        self.assertNotIn("document.hidden", match.group("body"))
+
+    def test_refreshes_when_open_page_becomes_visible_again(self):
+        js = Path("web/app.js").read_text(encoding="utf-8")
+
+        self.assertIn('document.addEventListener("visibilitychange"', js)
+        self.assertIn("refreshLiveWhenAllowed", js)
 
     def test_shows_reconciliation_controls_and_records(self):
         html = Path("web/index.html").read_text(encoding="utf-8")
