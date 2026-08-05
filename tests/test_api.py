@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 import warnings
 from pathlib import Path
@@ -59,11 +60,20 @@ class ApiTests(unittest.TestCase):
             added = client.post("/api/funds", json={"code": "161725", "alias": "白酒"})
             listed = client.get("/api/funds")
             valuations = client.get("/api/valuations")
+            for _ in range(50):
+                if valuations.json():
+                    break
+                time.sleep(0.02)
+                valuations = client.get("/api/valuations")
             snapshot = client.post("/api/snapshots", json={"snapshot_key": "2026-07-31 15:00"})
             reconciliation = client.post("/api/reconciliations")
             reconciliation_rows = client.get("/api/reconciliations")
             snapshots = client.get("/api/snapshots")
             snapshot_rows = client.get("/api/snapshots/2026-07-31%2015%3A00")
+            deleted_snapshot = client.delete("/api/snapshots/2026-07-31%2015%3A00")
+            deleted_snapshot_again = client.delete("/api/snapshots/2026-07-31%2015%3A00")
+            snapshots_after_delete = client.get("/api/snapshots")
+            snapshot_rows_after_delete = client.get("/api/snapshots/2026-07-31%2015%3A00")
             deleted = client.delete("/api/funds/161725")
 
         self.assertEqual(added.status_code, 200)
@@ -80,6 +90,11 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(snapshots.json()[0]["count"], 1)
         self.assertEqual(snapshot_rows.json()[0]["code"], "161725")
         self.assertAlmostEqual(snapshot_rows.json()[0]["actual_nav"], 1.009)
+        self.assertEqual(deleted_snapshot.status_code, 200)
+        self.assertEqual(deleted_snapshot.json(), {"snapshot_key": "2026-07-31 15:00", "deleted": 1})
+        self.assertEqual(deleted_snapshot_again.status_code, 404)
+        self.assertEqual(snapshots_after_delete.json(), [])
+        self.assertEqual(snapshot_rows_after_delete.json(), [])
         self.assertEqual(deleted.json(), {"deleted": True})
 
 

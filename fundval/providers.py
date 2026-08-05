@@ -1,22 +1,57 @@
 from __future__ import annotations
 
 import html
+import json
 import re
-from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from threading import Lock
 from typing import Any
 
 from .factor_fit import DEFAULT_FACTOR_UNIVERSE, FactorPoint
 from .valuation import Holding, LatestNav, OfficialEstimate, Quote
 
 
+STATIC_DAY_CACHE_TTL = timedelta(days=1)
+PUBLISHED_NAV_CACHE_TTL = timedelta(hours=12)
+TRACKING_INDEX_BY_FUND_CODE = {
+    "001595": ("sz399986", "中证银行"),
+    "005693": ("sz399967", "中证军工"),
+    "012414": ("sz399997", "中证白酒"),
+}
+TRACKING_INDEX_BY_FUND_NAME = (
+    ("中证银行", "sz399986", "中证银行"),
+    ("中证军工", "sz399967", "中证军工"),
+    ("中证白酒", "sz399997", "中证白酒"),
+)
+QDII_BENCHMARK_BY_FUND_CODE = {
+    "539001": {
+        "benchmark_symbol": "QQQ",
+        "benchmark_name": "纳斯达克100/QQQ",
+        "fx_symbol": "USDCNYC",
+    },
+}
+QDII_BENCHMARK_BY_FUND_NAME = (
+    ("纳斯达克100", "QQQ", "纳斯达克100/QQQ", "USDCNYC"),
+    ("纳指100", "QQQ", "纳斯达克100/QQQ", "USDCNYC"),
+)
+
+
 class AkshareProvider:
     def __init__(self, cache_ttl_seconds: int = 300):
         self.cache_ttl = timedelta(seconds=cache_ttl_seconds)
         self._cache: dict[str, tuple[datetime, Any]] = {}
+        self._cache_lock = Lock()
+        self._cache_key_locks: dict[str, Lock] = {}
         self.factor_universe = list(DEFAULT_FACTOR_UNIVERSE)
 
     def get_fund_name(self, code: str) -> str | None:
-        df = self._cached("fund_names", self._fetch_fund_names, timedelta(hours=12))
+        df = self._cached(
+            "fund_names",
+            self._fetch_fund_names,
+            STATIC_DAY_CACHE_TTL,
+            current_day_only=True,
+        )
         if df is None or df.empty:
             return None
         matched = df[df["基金代码"].astype(str).str.zfill(6) == code]
@@ -54,8 +89,11 @@ class AkshareProvider:
         return None
 
     def get_latest_nav(self, code: str) -> LatestNav | None:
-        ak = self._ak()
-        df = ak.fund_open_fund_info_em(symbol=code, indicator="单位净值走势")
+        latest = _latest_nav_from_points(self._eastmoney_nav_points(code))
+        if latest is not None:
+            return latest
+        return None
+        df = self._fund_nav_frame(code)
         if df is None or df.empty:
             return None
         row = df.iloc[-1]
@@ -68,8 +106,10 @@ class AkshareProvider:
         target_date = str(nav_date or "").strip()[:10]
         if not target_date:
             return None
-        ak = self._ak()
-        df = ak.fund_open_fund_info_em(symbol=code, indicator="\u5355\u4f4d\u51c0\u503c\u8d70\u52bf")
+        for point in reversed(self._eastmoney_nav_points(code)):
+            if point.date == target_date:
+                return LatestNav(nav=point.value, date=point.date)
+        df = self._fund_nav_frame(code)
         if df is None or df.empty:
             return None
         nav_columns = ("\u5355\u4f4d\u51c0\u503c", "\u51c0\u503c", "NAV")
@@ -85,8 +125,10 @@ class AkshareProvider:
         return None
 
     def get_nav_history(self, code: str, limit: int = 120) -> list[FactorPoint]:
-        ak = self._ak()
-        df = ak.fund_open_fund_info_em(symbol=code, indicator="单位净值走势")
+        points = self._eastmoney_nav_points(code)
+        if points:
+            return points[-max(2, int(limit or 120)) :]
+        df = self._fund_nav_frame(code)
         return _points_from_dataframe(
             df,
             date_names=("净值日期", "日期", "date"),
@@ -94,24 +136,78 @@ class AkshareProvider:
             limit=limit,
         )
 
+    def _eastmoney_nav_points(self, code: str) -> list[FactorPoint]:
+        try:
+            return self._cached(
+                f"eastmoney_nav_points:{code}",
+                lambda current=code: self._fetch_eastmoney_nav_points(current),
+                PUBLISHED_NAV_CACHE_TTL,
+                current_day_only=True,
+            ) or []
+        except Exception:
+            return []
+
+    def _fetch_eastmoney_nav_points(self, code: str) -> list[FactorPoint]:
+        return _eastmoney_nav_points_from_text(self._fetch_eastmoney_nav_text(code))
+
+    def _fetch_eastmoney_nav_text(self, code: str) -> str:
+        import requests
+
+        url = f"https://fund.eastmoney.com/pingzhongdata/{code}.js?v={int(datetime.now().timestamp() * 1000)}"
+        response = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=5,
+        )
+        response.raise_for_status()
+        return response.text
+
     def get_holdings(self, code: str) -> list[Holding]:
+        return self._cached(
+            f"holdings:{code}",
+            lambda current=code: self._fetch_holdings(current),
+            STATIC_DAY_CACHE_TTL,
+            current_day_only=True,
+        ) or []
+
+    def _fetch_holdings(self, code: str) -> list[Holding]:
         ak = self._ak()
         current_year = datetime.now().year
-        frames = []
-        for year in ("", *range(current_year, current_year - 5, -1)):
+        try:
+            latest_frame = ak.fund_portfolio_hold_em(symbol=code, date="")
+            if latest_frame is not None and not latest_frame.empty:
+                holdings = self._holdings_from_dataframe(latest_frame)
+                if holdings:
+                    return holdings
+        except Exception:
+            pass
+
+        eastmoney_available, holdings = self._try_eastmoney_holdings(code)
+        if eastmoney_available:
+            return holdings
+
+        for year in range(current_year, current_year - 5, -1):
             try:
                 frame = ak.fund_portfolio_hold_em(symbol=code, date=str(year))
-                if frame is not None and not frame.empty:
-                    frames.append(frame)
             except Exception:
                 continue
-        if not frames:
-            return self._get_eastmoney_holdings(code)
-        for df in frames:
-            holdings = self._holdings_from_dataframe(df)
+            if frame is None or frame.empty:
+                continue
+            holdings = self._holdings_from_dataframe(frame)
             if holdings:
                 return holdings
-        return self._get_eastmoney_holdings(code)
+        return []
+
+    def _fund_nav_frame(self, code: str):
+        return self._cached(
+            f"fund_nav:{code}",
+            lambda current=code: self._ak().fund_open_fund_info_em(
+                symbol=current,
+                indicator="单位净值走势",
+            ),
+            PUBLISHED_NAV_CACHE_TTL,
+            current_day_only=True,
+        )
 
     def _holdings_from_dataframe(self, df) -> list[Holding]:
         holdings: list[Holding] = []
@@ -152,6 +248,12 @@ class AkshareProvider:
                 holdings.append(Holding(name=name, code=stock_code, weight_pct=weight))
         return holdings[:10]
 
+    def _try_eastmoney_holdings(self, code: str) -> tuple[bool, list[Holding]]:
+        try:
+            return True, self._get_eastmoney_holdings(code)
+        except Exception:
+            return False, []
+
     def _fetch_eastmoney_holdings_html(self, code: str) -> str:
         import requests
 
@@ -165,7 +267,7 @@ class AkshareProvider:
                 "User-Agent": "Mozilla/5.0",
                 "Referer": f"https://fundf10.eastmoney.com/ccmx_{code}.html",
             },
-            timeout=15,
+            timeout=5,
         )
         response.raise_for_status()
         return response.text
@@ -195,14 +297,26 @@ class AkshareProvider:
     def get_factor_histories(self, limit: int = 120) -> dict[str, list[FactorPoint]]:
         result: dict[str, list[FactorPoint]] = {}
         row_limit = max(2, int(limit or 120))
-        for factor in self.factor_universe:
+        factors = list(self.factor_universe)
+
+        def load_factor(factor):
             points = self._cached(
                 f"factor_history:{factor.code}",
                 lambda current=factor.code: self._fetch_factor_history(current),
-                timedelta(hours=6),
+                STATIC_DAY_CACHE_TTL,
+                current_day_only=True,
             )
+            return factor.code, points[-row_limit:] if points else None
+
+        worker_count = min(4, len(factors))
+        if worker_count <= 1:
+            loaded = [load_factor(factor) for factor in factors]
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                loaded = list(executor.map(load_factor, factors))
+        for code, points in loaded:
             if points:
-                result[factor.code] = points[-row_limit:]
+                result[code] = points
         return result
 
     def get_factor_quotes(self, factor_codes: list[str]) -> dict[str, Quote]:
@@ -222,6 +336,97 @@ class AkshareProvider:
             if fallback is not None:
                 quotes[code] = fallback
         return quotes
+
+    def get_tracking_index_quote(self, code: str, fund_name: str | None = None) -> Quote | None:
+        index = _tracking_index_for_fund(code, fund_name)
+        if index is None:
+            return None
+        index_code, index_name = index
+        return self._cached(
+            f"tracking_index_quote:{index_code}",
+            lambda current_code=index_code, current_name=index_name: self._fetch_tracking_index_quote(
+                current_code,
+                current_name,
+            ),
+            timedelta(seconds=60),
+        )
+
+    def _fetch_tracking_index_quote(self, index_code: str, index_name: str) -> Quote | None:
+        try:
+            quote = _index_quote_from_dataframe(self._ak().stock_zh_index_spot_em(), index_code, index_name)
+        except Exception:
+            quote = None
+        if quote is not None:
+            return quote
+        return self._factor_quote_from_history(index_code, index_name)
+
+    def get_qdii_benchmark_quote(
+        self,
+        code: str,
+        fund_name: str | None = None,
+        from_date: str | None = None,
+        to_date: str | None = None,
+    ) -> dict | None:
+        benchmark = _qdii_benchmark_for_fund(code, fund_name)
+        start_key = _date_key(from_date)
+        end_key = _date_key(to_date)
+        if benchmark is None or not start_key or not end_key or start_key >= end_key:
+            return None
+
+        benchmark_symbol = benchmark["benchmark_symbol"]
+        fx_symbol = benchmark["fx_symbol"]
+        benchmark_points = self._cached(
+            f"qdii_benchmark_history:{benchmark_symbol}",
+            lambda current=benchmark_symbol: self._fetch_us_symbol_history(current),
+            STATIC_DAY_CACHE_TTL,
+            current_day_only=True,
+        ) or []
+        fx_points = self._cached(
+            f"fx_history:{fx_symbol}",
+            lambda current=fx_symbol: self._fetch_fx_history(current),
+            STATIC_DAY_CACHE_TTL,
+            current_day_only=True,
+        ) or []
+        benchmark_start = _point_on_or_before(benchmark_points, start_key)
+        benchmark_end = _point_on_or_before(benchmark_points, end_key)
+        fx_start = _point_on_or_before(fx_points, start_key)
+        fx_end = _point_on_or_before(fx_points, end_key)
+        if benchmark_start is None or benchmark_end is None or fx_start is None or fx_end is None:
+            return None
+        if benchmark_start.value <= 0 or fx_start.value <= 0:
+            return None
+        benchmark_ratio = benchmark_end.value / benchmark_start.value
+        fx_ratio = fx_end.value / fx_start.value
+        return {
+            "source": "qdii_benchmark",
+            "benchmark_symbol": benchmark_symbol,
+            "benchmark_name": benchmark["benchmark_name"],
+            "fx_symbol": fx_symbol,
+            "benchmark_growth_pct": round((benchmark_ratio - 1) * 100.0, 4),
+            "fx_growth_pct": round((fx_ratio - 1) * 100.0, 4),
+            "change_pct": round((benchmark_ratio * fx_ratio - 1) * 100.0, 4),
+            "benchmark_start_date": benchmark_start.date,
+            "benchmark_end_date": benchmark_end.date,
+            "fx_start_date": fx_start.date,
+            "fx_end_date": fx_end.date,
+        }
+
+    def _fetch_us_symbol_history(self, symbol: str) -> list[FactorPoint]:
+        ak = self._ak()
+        df = ak.stock_us_daily(symbol=symbol)
+        return _points_from_dataframe(
+            df,
+            date_names=("date", "日期", "trade_date"),
+            value_names=("close", "收盘", "收盘价", "最新价"),
+        )
+
+    def _fetch_fx_history(self, symbol: str) -> list[FactorPoint]:
+        df = self._ak().forex_hist_em(symbol=symbol)
+        return _points_from_dataframe(
+            df,
+            date_names=("日期", "date", "trade_date"),
+            value_names=("最新价", "close", "收盘", "收盘价"),
+        )
 
     def _get_tencent_quotes(self, codes: set[str]) -> dict[str, Quote]:
         query = ",".join(_tencent_symbol(code) for code in sorted(codes))
@@ -254,12 +459,22 @@ class AkshareProvider:
 
     def is_trading_day(self, current) -> bool:
         date_key = str(current)[:10]
-        dates = self._cached("trade_dates", self._fetch_trade_dates, timedelta(hours=12))
+        dates = self._cached(
+            "trade_dates",
+            self._fetch_trade_dates,
+            STATIC_DAY_CACHE_TTL,
+            current_day_only=True,
+        )
         return date_key in dates
 
     def latest_trading_day(self, current, include_current: bool = True) -> str | None:
         date_key = str(current)[:10]
-        dates = self._cached("trade_dates", self._fetch_trade_dates, timedelta(hours=12))
+        dates = self._cached(
+            "trade_dates",
+            self._fetch_trade_dates,
+            STATIC_DAY_CACHE_TTL,
+            current_day_only=True,
+        )
         if not dates:
             return None
         candidates = [value for value in dates if value <= date_key] if include_current else [value for value in dates if value < date_key]
@@ -300,7 +515,8 @@ class AkshareProvider:
         points = self._cached(
             f"factor_history:{code}",
             lambda current=code: self._fetch_factor_history(current),
-            timedelta(hours=6),
+            STATIC_DAY_CACHE_TTL,
+            current_day_only=True,
         )
         if points is None or len(points) < 2:
             return None
@@ -315,15 +531,27 @@ class AkshareProvider:
             trade_date=latest.date,
         )
 
-    def _cached(self, key: str, loader, ttl: timedelta | None = None):
+    def _cached(self, key: str, loader, ttl: timedelta | None = None, current_day_only: bool = False):
         now = datetime.now()
         effective_ttl = ttl or self.cache_ttl
-        cached = self._cache.get(key)
-        if cached and now - cached[0] < effective_ttl:
+        with self._cache_lock:
+            cached = self._cache.get(key)
+            key_lock = self._cache_key_locks.get(key)
+            if key_lock is None:
+                key_lock = Lock()
+                self._cache_key_locks[key] = key_lock
+        if cached and _is_cache_fresh(cached[0], now, effective_ttl, current_day_only):
             return cached[1]
-        value = loader()
-        self._cache[key] = (now, value)
-        return value
+        with key_lock:
+            now = datetime.now()
+            with self._cache_lock:
+                cached = self._cache.get(key)
+            if cached and _is_cache_fresh(cached[0], now, effective_ttl, current_day_only):
+                return cached[1]
+            value = loader()
+            with self._cache_lock:
+                self._cache[key] = (now, value)
+            return value
 
     @staticmethod
     def _ak():
@@ -342,6 +570,12 @@ def _parse_float(value) -> float | None:
         return float(text)
     except ValueError:
         return None
+
+
+def _is_cache_fresh(cached_at: datetime, now: datetime, ttl: timedelta, current_day_only: bool) -> bool:
+    if current_day_only and cached_at.date() != now.date():
+        return False
+    return now - cached_at < ttl
 
 
 def _first_present(row, names: tuple[str, ...]):
@@ -456,6 +690,79 @@ def _quotes_from_dataframe(df, target_codes: set[str]) -> dict[str, Quote]:
     return result
 
 
+def _tracking_index_for_fund(code: str, fund_name: str | None) -> tuple[str, str] | None:
+    fund_code = _normalize_stock_code(code)
+    if fund_code in TRACKING_INDEX_BY_FUND_CODE:
+        return TRACKING_INDEX_BY_FUND_CODE[fund_code]
+    name = str(fund_name or "")
+    if not any(marker in name for marker in ("ETF联接", "ETF聯接", "指数", "指數", "LOF")):
+        return None
+    for marker, index_code, index_name in TRACKING_INDEX_BY_FUND_NAME:
+        if marker in name:
+            return index_code, index_name
+    return None
+
+
+def _qdii_benchmark_for_fund(code: str, fund_name: str | None) -> dict | None:
+    fund_code = _normalize_stock_code(code)
+    if fund_code in QDII_BENCHMARK_BY_FUND_CODE:
+        return QDII_BENCHMARK_BY_FUND_CODE[fund_code]
+    name = str(fund_name or "")
+    upper_name = name.upper()
+    if "QDII" not in upper_name:
+        return None
+    for marker, benchmark_symbol, benchmark_name, fx_symbol in QDII_BENCHMARK_BY_FUND_NAME:
+        if marker in name:
+            return {
+                "benchmark_symbol": benchmark_symbol,
+                "benchmark_name": benchmark_name,
+                "fx_symbol": fx_symbol,
+            }
+    return None
+
+
+def _point_on_or_before(points: list[FactorPoint], date_key: str) -> FactorPoint | None:
+    for point in reversed(points):
+        if point.date <= date_key:
+            return point
+    return None
+
+
+def _latest_nav_from_points(points: list[FactorPoint]) -> LatestNav | None:
+    if not points:
+        return None
+    latest = points[-1]
+    return LatestNav(nav=latest.value, date=latest.date)
+
+
+def _eastmoney_nav_points_from_text(text: str) -> list[FactorPoint]:
+    match = re.search(r"var\s+Data_netWorthTrend\s*=\s*(?P<trend>\[.*?\]);", text or "", re.S)
+    if not match:
+        return []
+    try:
+        rows = json.loads(match.group("trend"))
+    except json.JSONDecodeError:
+        return []
+    points: list[FactorPoint] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        date_key = _eastmoney_timestamp_date(row.get("x"))
+        value = _parse_float(row.get("y"))
+        if date_key and value is not None and value > 0:
+            points.append(FactorPoint(date=date_key, value=value))
+    points.sort(key=lambda item: item.date)
+    return points
+
+
+def _eastmoney_timestamp_date(value) -> str:
+    try:
+        timestamp_ms = float(value)
+    except (TypeError, ValueError):
+        return ""
+    return (datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
+
+
 def _points_from_dataframe(
     df,
     date_names: tuple[str, ...],
@@ -504,6 +811,36 @@ def _index_quotes_from_dataframe(df, factor_universe) -> dict[str, Quote]:
     return result
 
 
+def _index_quote_from_dataframe(df, code: str, name: str) -> Quote | None:
+    if df is None or df.empty:
+        return None
+    target_digits = _index_digits(code)
+    for _, row in df.iterrows():
+        digits = _index_digits(str(_first_present(row, ("代码", "symbol", "指数代码")) or ""))
+        row_name = str(_first_present(row, ("名称", "name", "指数简称")) or "")
+        if digits != target_digits and row_name != name:
+            continue
+        change_pct = _parse_float(_first_present(row, ("涨跌幅", "涨跌幅%", "change_pct")))
+        if change_pct is None:
+            return None
+        quote_time = _extract_datetime_text(
+            row,
+            ("时间", "日期", "更新时间", "最新交易日", "trade_date", "date", "time"),
+        )
+        return Quote(
+            code=code,
+            name=row_name or name or code,
+            change_pct=change_pct,
+            quote_time=quote_time,
+            trade_date=_extract_date_text(
+                row,
+                ("日期", "最新交易日", "交易日期", "trade_date", "date"),
+            )
+            or _date_key(quote_time),
+        )
+    return None
+
+
 def _index_digits(code: str) -> str:
     digits = "".join(ch for ch in str(code or "") if ch.isdigit())
     return digits[-6:] if len(digits) >= 6 else digits
@@ -515,6 +852,8 @@ def _tencent_symbol(code: str) -> str:
         return f"us{normalized}"
     if len(normalized) == 5:
         return f"hk{normalized}"
+    if normalized.startswith(("4", "8", "920")):
+        return f"bj{normalized}"
     if normalized.startswith(("5", "6", "9")):
         return f"sh{normalized}"
     return f"sz{normalized}"

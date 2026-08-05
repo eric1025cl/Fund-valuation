@@ -1,4 +1,5 @@
 const AUTO_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
+const AUTO_REFRESH_END_MINUTE = 15 * 60 + 5;
 
 const state = {
   view: "live",
@@ -9,6 +10,7 @@ const state = {
   reconciliations: [],
   selectedSnapshotKey: null,
   lastValuationUpdatedAt: null,
+  liveRefreshRetryId: null,
   tradingStatus: null,
 };
 
@@ -71,7 +73,7 @@ refreshButton.addEventListener("click", async () => {
   if (state.view === "snapshots") {
     await loadSnapshots();
   } else {
-    await loadLive();
+    await loadLive({ forceRefresh: true });
   }
 });
 
@@ -115,14 +117,16 @@ reconcileButton.addEventListener("click", async () => {
   }
 });
 
-async function loadLive() {
+async function loadLive(options = {}) {
+  const forceRefresh = Boolean(options.forceRefresh);
   refreshButton.disabled = true;
   try {
+    const valuationUrl = forceRefresh ? "/api/valuations?refresh=1" : "/api/valuations";
     const [healthResponse, tradingStatusResponse, fundsResponse, valuationResponse] = await Promise.all([
       fetch("/api/health"),
       fetch("/api/trading-status"),
       fetch("/api/funds"),
-      fetch("/api/valuations"),
+      fetch(valuationUrl),
     ]);
     const health = await healthResponse.json();
     state.tradingStatus = await tradingStatusResponse.json();
@@ -131,10 +135,36 @@ async function loadLive() {
     state.lastValuationUpdatedAt = new Date();
     renderHealth(health);
     renderLive();
+    schedulePendingLiveRetry();
   } catch (error) {
     showError(fundList, "无法连接本地服务");
   } finally {
     refreshButton.disabled = false;
+  }
+}
+
+function schedulePendingLiveRetry() {
+  const hasFunds = Array.isArray(state.funds) && state.funds.length > 0;
+  const hasValuations = Array.isArray(state.valuations) && state.valuations.length > 0;
+  if (!hasFunds || hasValuations || state.view !== "live" || document.hidden) {
+    clearPendingLiveRetry();
+    return;
+  }
+  if (state.liveRefreshRetryId !== null) {
+    return;
+  }
+  state.liveRefreshRetryId = window.setTimeout(() => {
+    state.liveRefreshRetryId = null;
+    if (state.view === "live" && !document.hidden) {
+      loadLive();
+    }
+  }, 3000);
+}
+
+function clearPendingLiveRetry() {
+  if (state.liveRefreshRetryId !== null) {
+    window.clearTimeout(state.liveRefreshRetryId);
+    state.liveRefreshRetryId = null;
   }
 }
 
@@ -159,8 +189,9 @@ async function loadInitialLive() {
 async function loadSnapshots() {
   const response = await fetch("/api/snapshots");
   state.snapshots = await response.json();
-  if (!state.selectedSnapshotKey && state.snapshots.length) {
-    state.selectedSnapshotKey = state.snapshots[0].snapshot_key;
+  const selectedExists = state.snapshots.some((item) => item.snapshot_key === state.selectedSnapshotKey);
+  if (!selectedExists) {
+    state.selectedSnapshotKey = state.snapshots[0]?.snapshot_key || null;
   }
   if (state.selectedSnapshotKey) {
     const detailResponse = await fetch(`/api/snapshots/${encodeURIComponent(state.selectedSnapshotKey)}`);
@@ -187,7 +218,7 @@ async function loadReconciliations() {
 function isTradingRefreshWindow(date) {
   const day = date.getDay();
   const minutes = date.getHours() * 60 + date.getMinutes();
-  return day >= 1 && day <= 5 && minutes >= 9 * 60 && minutes <= 15 * 60;
+  return day >= 1 && day <= 5 && minutes >= 9 * 60 && minutes <= AUTO_REFRESH_END_MINUTE;
 }
 
 function startAutoRefresh() {
@@ -306,10 +337,13 @@ function renderSnapshots() {
 
   snapshotList.innerHTML = state.snapshots
     .map((item) => `
-      <button class="snapshot-chip ${item.snapshot_key === state.selectedSnapshotKey ? "active" : ""}" data-snapshot="${escapeHtml(item.snapshot_key)}">
-        <strong>${escapeHtml(item.snapshot_date || item.snapshot_key)}</strong>
-        <span>${item.count} 只基金 · ${escapeHtml(item.snapshot_key)}</span>
-      </button>
+      <div class="snapshot-chip-wrap">
+        <button class="snapshot-chip ${item.snapshot_key === state.selectedSnapshotKey ? "active" : ""}" data-snapshot="${escapeHtml(item.snapshot_key)}">
+          <strong>${escapeHtml(item.snapshot_date || item.snapshot_key)}</strong>
+          <span>${item.count} 只基金 · ${escapeHtml(item.snapshot_key)}</span>
+        </button>
+        <button class="snapshot-delete-button" data-delete-snapshot="${escapeHtml(item.snapshot_key)}" type="button" title="删除快照" aria-label="删除快照">&times;</button>
+      </div>
     `)
     .join("");
 
@@ -319,9 +353,32 @@ function renderSnapshots() {
       await loadSnapshots();
     });
   });
+  document.querySelectorAll("[data-delete-snapshot]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      await deleteSnapshot(button.dataset.deleteSnapshot);
+    });
+  });
 
   snapshotDetail.innerHTML = renderFundTable(state.snapshotRows, false, true);
   renderReconciliations();
+}
+
+async function deleteSnapshot(snapshotKey) {
+  if (!snapshotKey) {
+    return;
+  }
+  if (!window.confirm(`确认物理删除快照 ${snapshotKey}？`)) {
+    return;
+  }
+  const response = await fetch(`/api/snapshots/${encodeURIComponent(snapshotKey)}`, { method: "DELETE" });
+  if (!response.ok && response.status !== 404) {
+    showError(snapshotDetail, "删除快照失败");
+    return;
+  }
+  if (state.selectedSnapshotKey === snapshotKey) {
+    state.selectedSnapshotKey = null;
+  }
+  await loadSnapshots();
 }
 
 function renderReconciliations() {
@@ -492,6 +549,7 @@ function sourceLabel(item) {
     official: "官方估算",
     holding: "持仓估算",
     factor_fit: "指数拟合",
+    qdii_benchmark: "海外基准",
     snapshot: "快照",
   };
   return labels[item.source] || item.source || item.status || "";
@@ -500,9 +558,25 @@ function sourceLabel(item) {
 function estimateExplanationItems(item) {
   return [
     { text: estimateRiskLabel(item), className: "risk-note" },
+    { text: qdiiBenchmarkLabel(item), className: "" },
     { text: factorFitLabel(item), className: "" },
     { text: styleDriftLabel(item), className: "" },
   ].filter((note) => note.text);
+}
+
+function qdiiBenchmarkLabel(item) {
+  if (item.source !== "qdii_benchmark") {
+    return null;
+  }
+  const name = item.benchmark_name || item.benchmark_symbol || "海外基准";
+  const parts = [];
+  if (typeof item.benchmark_growth_pct === "number") {
+    parts.push(`基准 ${formatPercent(item.benchmark_growth_pct)}`);
+  }
+  if (typeof item.fx_growth_pct === "number") {
+    parts.push(`汇率 ${formatPercent(item.fx_growth_pct)}`);
+  }
+  return parts.length ? `${name} / ${parts.join(" / ")}` : name;
 }
 
 function factorFitLabel(item) {
@@ -541,10 +615,24 @@ function estimateRiskLabel(item) {
   if (Array.isArray(item.estimate_risk_reasons)) {
     item.estimate_risk_reasons.map(estimateRiskReasonLabel).filter(Boolean).forEach((label) => details.push(label));
   }
-  if (typeof item.uncovered_weight_pct === "number" && item.uncovered_proxy_source === "factor_fit") {
-    details.push(`未覆盖仓位 ${formatPercent(item.uncovered_weight_pct)} 用指数拟合`);
+  const proxyLabel = uncoveredProxyLabel(item);
+  if (typeof item.uncovered_weight_pct === "number" && proxyLabel) {
+    details.push(`未覆盖仓位 ${formatPercent(item.uncovered_weight_pct)} ${proxyLabel}`);
   }
   return `估值风险 ${level}${details.length ? ` · ${details.join(" · ")}` : ""}`;
+}
+
+function uncoveredProxyLabel(item) {
+  if (item.uncovered_proxy_source === "tracking_index") {
+    return item.uncovered_proxy_name ? `用跟踪指数 ${item.uncovered_proxy_name}` : "用跟踪指数";
+  }
+  if (item.uncovered_proxy_source === "factor_fit") {
+    return "用指数拟合";
+  }
+  if (item.uncovered_proxy_source === "holding_momentum_blend") {
+    return "用持仓动量混合";
+  }
+  return null;
 }
 
 function estimateRiskReasonLabel(reason) {

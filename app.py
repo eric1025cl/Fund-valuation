@@ -72,8 +72,8 @@ def create_app(
         return {"deleted": deleted}
 
     @api.get("/api/valuations")
-    def estimate_watchlist():
-        return valuation_service.estimate_watchlist()
+    def estimate_watchlist(refresh: bool = False):
+        return valuation_service.estimate_watchlist_cached(force_refresh=refresh)
 
     @api.get("/api/valuation/{code}")
     def estimate_fund(code: str):
@@ -93,6 +93,13 @@ def create_app(
     @api.get("/api/snapshots/{snapshot_key}")
     def get_snapshot(snapshot_key: str):
         return valuation_service.get_snapshot(snapshot_key)
+
+    @api.delete("/api/snapshots/{snapshot_key}")
+    def delete_snapshot(snapshot_key: str):
+        deleted = valuation_service.delete_snapshot(snapshot_key)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="snapshot not found")
+        return {"snapshot_key": snapshot_key, "deleted": deleted}
 
     @api.get("/api/reconciliations")
     def list_reconciliations(limit: int = 50):

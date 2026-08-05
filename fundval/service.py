@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from datetime import date, datetime, time, timedelta
+from threading import Lock, Thread
 from typing import Protocol
 
 from .store import WatchFund, WatchlistStore, normalize_fund_code
@@ -20,6 +22,7 @@ from .valuation import (
 SNAPSHOT_REPAIR_INTERVAL = timedelta(minutes=10)
 RECONCILIATION_RETRY_INTERVAL = timedelta(minutes=30)
 SNAPSHOT_SAVE_MINUTE = 15 * 60 + 5
+LIVE_REFRESH_CACHE_TTL = timedelta(minutes=10)
 
 
 class FundDataProvider(Protocol):
@@ -35,6 +38,16 @@ class FundDataProvider(Protocol):
 
     def get_quotes(self, stock_codes: list[str]) -> dict[str, Quote]: ...
 
+    def get_tracking_index_quote(self, code: str, fund_name: str | None = None) -> Quote | None: ...
+
+    def get_qdii_benchmark_quote(
+        self,
+        code: str,
+        fund_name: str | None = None,
+        from_date: str | None = None,
+        to_date: str | None = None,
+    ) -> dict | None: ...
+
     def health(self) -> dict: ...
 
 
@@ -44,40 +57,201 @@ class FundValuationService:
         store: WatchlistStore,
         provider: FundDataProvider,
         min_coverage_pct: float = 35.0,
+        max_workers: int = 4,
+        live_refresh_timeout_seconds: float = 25.0,
+        live_refresh_max_workers: int = 8,
     ):
         self.store = store
         self.provider = provider
         self.min_coverage_pct = min_coverage_pct
+        self.max_workers = max(1, int(max_workers or 1))
+        self.live_refresh_timeout_seconds = max(0.1, float(live_refresh_timeout_seconds or 0.1))
+        self.live_refresh_max_workers = max(1, int(live_refresh_max_workers or 1))
         self._last_reconciliation_attempt_at: datetime | None = None
+        self._watchlist_cache: list[dict] | None = None
+        self._watchlist_cache_at: datetime | None = None
+        self._watchlist_refreshing = False
+        self._watchlist_cache_generation = 0
+        self._watchlist_cache_lock = Lock()
 
     def add_fund(self, code: str, alias: str | None = None) -> WatchFund:
         fund_code = normalize_fund_code(code)
         name = self._safe_call(lambda: self.provider.get_fund_name(fund_code))
-        return self.store.add_fund(fund_code, alias=alias, name=name)
+        fund = self.store.add_fund(fund_code, alias=alias, name=name)
+        self.invalidate_watchlist_cache()
+        return fund
 
     def list_funds(self) -> list[dict]:
         return [fund.to_dict() for fund in self.store.list_funds()]
 
     def delete_fund(self, code: str) -> bool:
-        return self.store.delete_fund(code)
+        deleted = self.store.delete_fund(code)
+        if deleted:
+            self.invalidate_watchlist_cache()
+        return deleted
+
+    def invalidate_watchlist_cache(self) -> None:
+        with self._watchlist_cache_lock:
+            self._watchlist_cache = None
+            self._watchlist_cache_at = None
+            self._watchlist_cache_generation += 1
+
+    def estimate_watchlist_cached(
+        self,
+        now: datetime | None = None,
+        max_age: timedelta = LIVE_REFRESH_CACHE_TTL,
+        force_refresh: bool = False,
+    ) -> list[dict]:
+        current = now or datetime.now()
+        context = self._valuation_context(current)
+        if self._should_use_previous_close_snapshot(context):
+            funds = self.store.list_funds()
+            if self.store.has_snapshot(self._previous_close_snapshot_key(context)):
+                return self._snapshot_estimates_for_funds(funds, context, current)
+
+        wall_clock = datetime.now()
+        should_refresh = False
+        refresh_generation = 0
+        with self._watchlist_cache_lock:
+            if (
+                not force_refresh
+                and self._watchlist_cache is not None
+                and self._watchlist_cache_at is not None
+                and wall_clock - self._watchlist_cache_at < max_age
+            ):
+                return _copy_result_rows(self._watchlist_cache)
+
+            if not self._watchlist_refreshing:
+                self._watchlist_refreshing = True
+                self._watchlist_cache_generation += 1
+                refresh_generation = self._watchlist_cache_generation
+                should_refresh = True
+
+            cached_rows = _copy_result_rows(self._watchlist_cache)
+
+        if should_refresh:
+            Thread(
+                target=self._refresh_watchlist_cache,
+                args=(current, refresh_generation),
+                daemon=True,
+            ).start()
+        return cached_rows
+
+    def _refresh_watchlist_cache(self, current: datetime, generation: int) -> None:
+        try:
+            rows = self._estimate_live_watchlist_with_timeout(current)
+            with self._watchlist_cache_lock:
+                if generation == self._watchlist_cache_generation:
+                    self._watchlist_cache = _copy_result_rows(rows)
+                    self._watchlist_cache_at = datetime.now()
+        finally:
+            with self._watchlist_cache_lock:
+                self._watchlist_refreshing = False
+
+    def _estimate_live_watchlist_with_timeout(self, current: datetime) -> list[dict]:
+        context = self._valuation_context(current)
+        funds = self.store.list_funds()
+        if self._should_use_previous_close_snapshot(context):
+            return self._snapshot_estimates_for_funds(funds, context, current)
+        if not funds:
+            return []
+
+        worker_count = min(self.live_refresh_max_workers, len(funds))
+        executor = ThreadPoolExecutor(max_workers=worker_count)
+        future_by_index = {
+            executor.submit(
+                self.estimate_fund,
+                fund.code,
+                now=current,
+                use_snapshot_cache=True,
+                include_factor_monitoring=False,
+                include_official_estimate=False,
+            ): (index, fund)
+            for index, fund in enumerate(funds)
+        }
+        results: list[dict | None] = [None] * len(funds)
+        try:
+            for future in as_completed(future_by_index, timeout=self.live_refresh_timeout_seconds):
+                index, fund = future_by_index[future]
+                try:
+                    results[index] = future.result()
+                except Exception:
+                    results[index] = self._live_refresh_unavailable_result(fund, context, "refresh_failed")
+        except TimeoutError:
+            pass
+        finally:
+            for future, (index, fund) in future_by_index.items():
+                if results[index] is None:
+                    future.cancel()
+                    results[index] = self._live_refresh_unavailable_result(fund, context, "refresh_timeout")
+            executor.shutdown(wait=False, cancel_futures=True)
+        return [result for result in results if result is not None]
+
+    def _live_refresh_unavailable_result(self, fund: WatchFund, context: dict, reason: str) -> dict:
+        result = {
+            "code": fund.code,
+            "alias": fund.alias,
+            "name": fund.name or f"鍩洪噾{fund.code}",
+            "status": "unavailable",
+            "source": "refresh",
+            "estimate_nav": None,
+            "estimate_growth_pct": None,
+            "coverage_pct": 0.0,
+            "confidence": 0.0,
+            "reason": reason,
+            "latest_nav": None,
+            "latest_nav_date": None,
+            "estimate_time": None,
+            "contributions": [],
+        }
+        self._attach_valuation_context(result, context)
+        return result
 
     def estimate_watchlist(
         self,
         now: datetime | None = None,
         use_snapshot_cache: bool = True,
+        include_factor_monitoring: bool = True,
+        include_official_estimate: bool = True,
     ) -> list[dict]:
         current = now or datetime.now()
         context = self._valuation_context(current)
         funds = self.store.list_funds()
         if use_snapshot_cache and self._should_use_previous_close_snapshot(context):
             return self._snapshot_estimates_for_funds(funds, context, current)
-        return [self.estimate_fund(fund.code, now=current, use_snapshot_cache=use_snapshot_cache) for fund in funds]
+        if len(funds) <= 1 or self.max_workers <= 1:
+            return [
+                self.estimate_fund(
+                    fund.code,
+                    now=current,
+                    use_snapshot_cache=use_snapshot_cache,
+                    include_factor_monitoring=include_factor_monitoring,
+                    include_official_estimate=include_official_estimate,
+                )
+                for fund in funds
+            ]
+        worker_count = min(self.max_workers, len(funds))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            return list(
+                executor.map(
+                    lambda fund: self.estimate_fund(
+                        fund.code,
+                        now=current,
+                        use_snapshot_cache=use_snapshot_cache,
+                        include_factor_monitoring=include_factor_monitoring,
+                        include_official_estimate=include_official_estimate,
+                    ),
+                    funds,
+                )
+            )
 
     def estimate_fund(
         self,
         code: str,
         now: datetime | None = None,
         use_snapshot_cache: bool = True,
+        include_factor_monitoring: bool = True,
+        include_official_estimate: bool = True,
     ) -> dict:
         current = now or datetime.now()
         context = self._valuation_context(current)
@@ -86,8 +260,8 @@ class FundValuationService:
             fund = self.store.get_fund(fund_code) or WatchFund(code=fund_code)
             return self._snapshot_estimate_for_fund(fund, context, current)
         stored_fund = self.store.get_fund(fund_code)
-        name = self._safe_call(lambda: self.provider.get_fund_name(fund_code)) or (
-            stored_fund.name if stored_fund else None
+        name = (stored_fund.name if stored_fund else None) or self._safe_call(
+            lambda: self.provider.get_fund_name(fund_code)
         )
         latest_nav = self._safe_call(lambda: self.provider.get_latest_nav(fund_code))
         target_trade_date = self._target_trade_date(name or "", context)
@@ -101,7 +275,11 @@ class FundValuationService:
         if actual_nav_result is not None:
             return self._with_calibrated_confidence(fund_code, actual_nav_result)
 
-        official = self._safe_call(lambda: self.provider.get_official_estimate(fund_code))
+        official = (
+            self._safe_call(lambda: self.provider.get_official_estimate(fund_code))
+            if include_official_estimate
+            else None
+        )
         if official is not None:
             latest_nav_value = round(float(latest_nav.nav), 6) if latest_nav is not None and latest_nav.nav > 0 else None
             result = {
@@ -131,6 +309,16 @@ class FundValuationService:
             )
             return self._with_calibrated_confidence(fund_code, result)
 
+        qdii_benchmark_result = self._qdii_benchmark_estimate(
+            fund_code,
+            name or "",
+            latest_nav,
+            context,
+            target_trade_date,
+        )
+        if qdii_benchmark_result is not None:
+            return self._with_calibrated_confidence(fund_code, qdii_benchmark_result)
+
         holdings = self._safe_call(lambda: self.provider.get_holdings(fund_code)) or []
         quotes = self._safe_call(lambda: self.provider.get_quotes([h.code for h in holdings])) or {}
         result = calculate_holding_estimate(
@@ -139,7 +327,8 @@ class FundValuationService:
             quotes=quotes,
             min_coverage_pct=self._coverage_floor(name or ""),
         ).to_dict()
-        factor_result = self._factor_fit_estimate(fund_code, latest_nav)
+        factor_result = self._factor_fit_estimate(fund_code, latest_nav) if include_factor_monitoring else None
+        tracking_quote = self._tracking_index_quote(fund_code, name or "")
         if result.get("status") != "estimated" and factor_result is not None and factor_result.status == "estimated":
             factor_data = factor_result.to_dict()
             factor_data.update(
@@ -158,7 +347,7 @@ class FundValuationService:
             )
             return self._with_calibrated_confidence(fund_code, factor_data)
 
-        self._blend_uncovered_holding_estimate(result, factor_result)
+        self._blend_uncovered_holding_estimate(result, factor_result, tracking_quote, name or "")
         self._attach_holding_estimate_risk(result)
         self._attach_factor_monitoring(result, factor_result)
         result.update(
@@ -220,6 +409,12 @@ class FundValuationService:
 
     def get_snapshot(self, snapshot_key: str) -> list[dict]:
         return self.store.get_snapshot(snapshot_key)
+
+    def delete_snapshot(self, snapshot_key: str) -> int:
+        deleted = self.store.delete_snapshot(snapshot_key)
+        if deleted:
+            self.invalidate_watchlist_cache()
+        return deleted
 
     def reconcile_snapshots(self, now: datetime | None = None) -> dict:
         current = now or datetime.now()
@@ -338,6 +533,74 @@ class FundValuationService:
             factor_quotes=quotes,
         )
 
+    def _tracking_index_quote(self, fund_code: str, fund_name: str) -> Quote | None:
+        get_tracking_index_quote = getattr(self.provider, "get_tracking_index_quote", None)
+        if not callable(get_tracking_index_quote):
+            return None
+        return self._safe_call(lambda: get_tracking_index_quote(fund_code, fund_name=fund_name))
+
+    def _qdii_benchmark_estimate(
+        self,
+        fund_code: str,
+        fund_name: str,
+        latest_nav: LatestNav | None,
+        context: dict,
+        target_trade_date: str,
+    ) -> dict | None:
+        if not _is_qdii_name(fund_name):
+            return None
+        if latest_nav is None or latest_nav.nav <= 0:
+            return None
+        latest_nav_date = _date_key(latest_nav.date)
+        if not latest_nav_date or not target_trade_date or latest_nav_date >= target_trade_date:
+            return None
+        get_qdii_benchmark_quote = getattr(self.provider, "get_qdii_benchmark_quote", None)
+        if not callable(get_qdii_benchmark_quote):
+            return None
+        quote = self._safe_call(
+            lambda: get_qdii_benchmark_quote(
+                fund_code,
+                fund_name=fund_name,
+                from_date=latest_nav_date,
+                to_date=target_trade_date,
+            )
+        )
+        if not isinstance(quote, dict):
+            return None
+        growth_pct = _number_or_none(quote.get("change_pct"))
+        if growth_pct is None:
+            return None
+        result = {
+            "code": fund_code,
+            "name": fund_name or f"基金{fund_code}",
+            "status": "estimated",
+            "source": "qdii_benchmark",
+            "estimate_nav": round(float(latest_nav.nav) * (1 + growth_pct / 100.0), 6),
+            "estimate_growth_pct": round(growth_pct, 4),
+            "coverage_pct": 100.0,
+            "confidence": 85.0,
+            "reason": None,
+            "latest_nav": round(float(latest_nav.nav), 6),
+            "latest_nav_date": latest_nav_date,
+            "estimate_time": None,
+            "contributions": [],
+        }
+        for key in (
+            "benchmark_symbol",
+            "benchmark_name",
+            "fx_symbol",
+            "benchmark_growth_pct",
+            "fx_growth_pct",
+            "benchmark_start_date",
+            "benchmark_end_date",
+            "fx_start_date",
+            "fx_end_date",
+        ):
+            if key in quote:
+                result[key] = quote[key]
+        self._attach_valuation_context(result, context, trade_date=target_trade_date)
+        return result
+
     @staticmethod
     def _attach_factor_monitoring(result: dict, factor_result) -> None:
         if factor_result is None or factor_result.status != "estimated":
@@ -362,14 +625,31 @@ class FundValuationService:
         )
 
     @staticmethod
-    def _blend_uncovered_holding_estimate(result: dict, factor_result) -> None:
+    def _blend_uncovered_holding_estimate(
+        result: dict,
+        factor_result,
+        tracking_quote: Quote | None = None,
+        fund_name: str = "",
+    ) -> None:
         if result.get("status") != "estimated" or result.get("source") != "holding":
             return
-        if factor_result is None or getattr(factor_result, "status", None) != "estimated":
+
+        proxy_source = None
+        proxy_name = None
+        factor_growth = None
+        proxy_growth = _number_or_none(getattr(tracking_quote, "change_pct", None))
+        if proxy_growth is not None:
+            proxy_source = "tracking_index"
+            proxy_name = getattr(tracking_quote, "name", None)
+        elif factor_result is not None and getattr(factor_result, "status", None) == "estimated":
+            factor_data = factor_result.to_dict()
+            factor_growth = _number_or_none(factor_data.get("estimate_growth_pct"))
+            if factor_growth is not None:
+                proxy_growth = factor_growth
+                proxy_source = "factor_fit"
+        else:
             return
 
-        factor_data = factor_result.to_dict()
-        proxy_growth = _number_or_none(factor_data.get("estimate_growth_pct"))
         coverage = _number_or_none(result.get("coverage_pct"))
         latest_nav = _number_or_none(result.get("latest_nav"))
         if proxy_growth is None or coverage is None or latest_nav is None or latest_nav <= 0:
@@ -388,12 +668,27 @@ class FundValuationService:
             return
 
         raw_growth = _number_or_none(result.get("estimate_growth_pct"))
+        momentum_proxy = _holding_momentum_proxy_growth(
+            raw_growth=raw_growth,
+            factor_growth=factor_growth,
+            coverage=coverage,
+            fund_name=fund_name,
+            tracking_quote=tracking_quote,
+        )
+        if momentum_proxy is not None:
+            proxy_source = "holding_momentum_blend"
+            proxy_growth = momentum_proxy["growth"]
+            result["holding_momentum_growth_pct"] = round(momentum_proxy["momentum_growth"], 4)
+            result["uncovered_proxy_momentum_weight_pct"] = round(momentum_proxy["momentum_weight"] * 100.0, 1)
+
         blended_growth = covered_contribution + proxy_growth * uncovered_weight / 100.0
         result["raw_holding_estimate_nav"] = result.get("estimate_nav")
         result["raw_holding_estimate_growth_pct"] = round(raw_growth, 4) if raw_growth is not None else None
         result["covered_contribution_pct"] = round(covered_contribution, 4)
         result["uncovered_weight_pct"] = round(uncovered_weight, 4)
-        result["uncovered_proxy_source"] = "factor_fit"
+        result["uncovered_proxy_source"] = proxy_source
+        if proxy_name:
+            result["uncovered_proxy_name"] = str(proxy_name)
         result["uncovered_proxy_growth_pct"] = round(proxy_growth, 4)
         result["estimate_growth_pct"] = round(blended_growth, 4)
         result["estimate_nav"] = round(latest_nav * (1 + blended_growth / 100.0), 6)
@@ -572,7 +867,7 @@ class FundValuationService:
 
     @staticmethod
     def _should_use_previous_close_snapshot(context: dict) -> bool:
-        return not context["is_trading_day"] and bool(context["trade_date"])
+        return bool(context["is_final"] and context["trade_date"])
 
     @staticmethod
     def _previous_close_snapshot_key(context: dict) -> str:
@@ -719,7 +1014,7 @@ class FundValuationService:
     @staticmethod
     def _is_refresh_window(current: datetime) -> bool:
         minutes = current.hour * 60 + current.minute
-        return 9 * 60 <= minutes <= 15 * 60
+        return 9 * 60 <= minutes <= SNAPSHOT_SAVE_MINUTE
 
     @staticmethod
     def _safe_call(fn):
@@ -757,6 +1052,38 @@ def _quote_trade_date(quotes: dict[str, Quote]) -> str:
 
 def _is_qdii_name(fund_name: str) -> bool:
     return "QDII" in str(fund_name or "").upper()
+
+
+def _is_index_like_name(fund_name: str) -> bool:
+    text = str(fund_name or "")
+    upper = text.upper()
+    return any(marker in text for marker in ("指数", "指數", "联接", "聯接")) or any(
+        marker in upper for marker in ("ETF", "LOF")
+    )
+
+
+def _holding_momentum_proxy_growth(
+    raw_growth: float | None,
+    factor_growth: float | None,
+    coverage: float | None,
+    fund_name: str,
+    tracking_quote: Quote | None,
+) -> dict | None:
+    if tracking_quote is not None or _is_qdii_name(fund_name) or _is_index_like_name(fund_name):
+        return None
+    if raw_growth is None or factor_growth is None or coverage is None:
+        return None
+    if coverage < 40.0 or abs(raw_growth) < 2.0:
+        return None
+    if abs(raw_growth - factor_growth) < 0.5:
+        return None
+
+    momentum_weight = 0.75 if coverage >= 65.0 else 0.65
+    return {
+        "growth": raw_growth * momentum_weight + factor_growth * (1.0 - momentum_weight),
+        "momentum_growth": raw_growth,
+        "momentum_weight": momentum_weight,
+    }
 
 
 def _is_usable_snapshot_row(row: dict) -> bool:
@@ -805,3 +1132,7 @@ def _number_or_none(value) -> float | None:
 def _number_or_zero(value) -> float:
     parsed = _number_or_none(value)
     return parsed if parsed is not None else 0.0
+
+
+def _copy_result_rows(rows: list[dict] | None) -> list[dict]:
+    return [dict(row) for row in rows or []]

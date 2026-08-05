@@ -101,6 +101,50 @@ class WatchlistStoreTests(unittest.TestCase):
         self.assertEqual(snapshots[0]["snapshot_date"], "2026-07-31")
         self.assertEqual(rows[0]["snapshot_date"], "2026-07-31")
 
+    def test_delete_snapshot_physically_removes_batch_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            store.save_snapshot(
+                "2026-07-31 15:00",
+                "2026-07-31 15:00:00",
+                [
+                    {
+                        "code": "161725",
+                        "name": "fund 161725",
+                        "status": "estimated",
+                        "source": "holding",
+                        "estimate_nav": 1.008,
+                        "estimate_growth_pct": 0.8,
+                    },
+                ],
+            )
+            store.save_snapshot(
+                "2026-08-03 15:00",
+                "2026-08-03 15:00:00",
+                [
+                    {
+                        "code": "000001",
+                        "name": "fund 000001",
+                        "status": "estimated",
+                        "source": "holding",
+                        "estimate_nav": 1.102,
+                        "estimate_growth_pct": 1.2,
+                    },
+                ],
+            )
+
+            deleted_count = store.delete_snapshot("2026-07-31 15:00")
+            deleted_again = store.delete_snapshot("2026-07-31 15:00")
+            deleted_rows = store.get_snapshot("2026-07-31 15:00")
+            remaining_rows = store.get_snapshot("2026-08-03 15:00")
+            snapshots = store.list_snapshots()
+
+        self.assertEqual(deleted_count, 1)
+        self.assertEqual(deleted_again, 0)
+        self.assertEqual(deleted_rows, [])
+        self.assertEqual(remaining_rows[0]["code"], "000001")
+        self.assertEqual([item["snapshot_key"] for item in snapshots], ["2026-08-03 15:00"])
+
     def test_reconciliation_backfills_snapshot_payload(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = WatchlistStore(Path(temp_dir) / "funds.db")

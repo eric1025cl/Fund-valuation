@@ -344,6 +344,18 @@ class WatchlistStore:
             result.append(item)
         return result
 
+    def delete_snapshot(self, snapshot_key: str) -> int:
+        clean_key = str(snapshot_key or "").strip()
+        if not clean_key:
+            return 0
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(
+                "DELETE FROM valuation_snapshots WHERE snapshot_key = ?",
+                (clean_key,),
+            )
+            conn.commit()
+        return int(cursor.rowcount or 0)
+
     def has_snapshot(self, snapshot_key: str) -> bool:
         clean_key = str(snapshot_key or "").strip()
         with closing(self._connect()) as conn:

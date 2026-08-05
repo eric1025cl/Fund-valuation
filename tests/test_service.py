@@ -1,4 +1,6 @@
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -99,6 +101,110 @@ class SnapshotOnlyProvider(FakeProvider):
         raise AssertionError("non-trading valuation should not request quotes")
 
 
+class StoredNameOnlyProvider(FakeProvider):
+    def __init__(self):
+        super().__init__()
+        self.name_calls = 0
+
+    def get_fund_name(self, code):
+        self.name_calls += 1
+        return "remote fund"
+
+    def get_official_estimate(self, code):
+        return OfficialEstimate(
+            nav=1.01,
+            growth_pct=1.0,
+            estimate_time="2026-07-31 10:30",
+        )
+
+
+class SlowLatestNavProvider(FakeProvider):
+    def __init__(self):
+        super().__init__(
+            official=OfficialEstimate(
+                nav=1.01,
+                growth_pct=1.0,
+                estimate_time="2026-07-31 10:30",
+            )
+        )
+        self.active = 0
+        self.max_active = 0
+        self.lock = threading.Lock()
+
+    def get_latest_nav(self, code):
+        with self.lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            time.sleep(0.05)
+            return LatestNav(nav=1.0, date="2026-07-30")
+        finally:
+            with self.lock:
+                self.active -= 1
+
+
+class BlockingRefreshProvider(FakeProvider):
+    def __init__(self):
+        super().__init__(
+            official=OfficialEstimate(
+                nav=1.02,
+                growth_pct=2.0,
+                estimate_time="2026-07-31 10:30",
+            )
+        )
+        self.calls = 0
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.lock = threading.Lock()
+
+    def get_latest_nav(self, code):
+        with self.lock:
+            self.calls += 1
+        self.started.set()
+        self.release.wait(timeout=2)
+        return LatestNav(nav=1.0, date="2026-07-30")
+
+
+class CountingFactorProvider(FakeProvider):
+    def __init__(self):
+        super().__init__()
+        self.nav_history_calls = 0
+
+    def get_nav_history(self, code, limit=120):
+        self.nav_history_calls += 1
+        return factor_points(1.0, [1.0] * 24)
+
+    def get_factor_histories(self, limit=120):
+        return {
+            "sh000300": factor_points(100.0, [1.0] * 24),
+        }
+
+    def get_factor_quotes(self, factor_codes):
+        return {"sh000300": Quote(code="sh000300", name="CSI 300", change_pct=1.2)}
+
+
+class UnavailableHoldingCountingFactorProvider(CountingFactorProvider):
+    def get_holdings(self, code):
+        return []
+
+    def get_quotes(self, stock_codes):
+        return {}
+
+
+class CountingOfficialProvider(FakeProvider):
+    def __init__(self):
+        super().__init__()
+        self.official_calls = 0
+
+    def get_official_estimate(self, code):
+        self.official_calls += 1
+        return OfficialEstimate(
+            nav=1.02,
+            growth_pct=2.0,
+            estimate_time="2026-07-31 10:30",
+        )
+
+
 class FundValuationServiceTests(unittest.TestCase):
     def test_add_fund_only_fetches_basic_info(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -147,6 +253,186 @@ class FundValuationServiceTests(unittest.TestCase):
         self.assertEqual(result["status"], "estimated")
         self.assertAlmostEqual(result["coverage_pct"], 50.0)
         self.assertAlmostEqual(result["estimate_growth_pct"], 0.8)
+
+    def test_estimate_uses_stored_fund_name_without_refetching_name(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            store.add_fund("161725", name="stored fund")
+            provider = StoredNameOnlyProvider()
+            service = FundValuationService(store=store, provider=provider)
+
+            result = service.estimate_fund("161725", now=TRADING_TIME)
+
+        self.assertEqual(result["name"], "stored fund")
+        self.assertEqual(provider.name_calls, 0)
+
+    def test_watchlist_estimates_multiple_funds_concurrently(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            for code in ("000001", "000002", "000003"):
+                store.add_fund(code, name=f"fund {code}")
+            provider = SlowLatestNavProvider()
+            service = FundValuationService(store=store, provider=provider)
+
+            rows = service.estimate_watchlist(now=TRADING_TIME)
+
+        self.assertEqual([row["code"] for row in rows], ["000001", "000002", "000003"])
+        self.assertGreater(provider.max_active, 1)
+
+    def test_cached_watchlist_returns_immediately_while_refresh_runs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            store.add_fund("161725", name="fund 161725")
+            provider = BlockingRefreshProvider()
+            service = FundValuationService(store=store, provider=provider)
+
+            rows = service.estimate_watchlist_cached(now=TRADING_TIME)
+            self.assertEqual(rows, [])
+            self.assertTrue(provider.started.wait(timeout=1))
+
+            second_rows = service.estimate_watchlist_cached(now=TRADING_TIME)
+            self.assertEqual(second_rows, [])
+            self.assertEqual(provider.calls, 1)
+
+            provider.release.set()
+            for _ in range(100):
+                refreshed = service.estimate_watchlist_cached(now=TRADING_TIME)
+                if refreshed:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("background refresh did not populate cache")
+
+        self.assertEqual(refreshed[0]["code"], "161725")
+        self.assertEqual(refreshed[0]["source"], "holding")
+
+    def test_cached_watchlist_uses_current_close_snapshot_after_market_close(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            store.add_fund("161725", "fund", name="fund 161725")
+            store.save_snapshot(
+                "2026-07-31 15:00",
+                "2026-07-31 15:05:00",
+                [
+                    {
+                        "code": "161725",
+                        "name": "fund 161725",
+                        "status": "estimated",
+                        "source": "holding",
+                        "estimate_nav": 1.0888,
+                        "estimate_growth_pct": 8.88,
+                        "coverage_pct": 70.0,
+                        "confidence": 60.0,
+                        "reason": None,
+                        "latest_nav": 1.0,
+                        "latest_nav_date": "2026-07-30",
+                        "trade_date": "2026-07-31",
+                        "market_phase": "closed",
+                        "is_final": True,
+                        "contributions": [],
+                    }
+                ],
+            )
+            service = FundValuationService(store=store, provider=SnapshotOnlyProvider())
+
+            rows = service.estimate_watchlist_cached(now=datetime(2026, 7, 31, 16, 0, 0))
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["snapshot_key"], "2026-07-31 15:00")
+        self.assertAlmostEqual(rows[0]["estimate_growth_pct"], 8.88)
+        self.assertEqual(rows[0]["trade_date"], "2026-07-31")
+
+    def test_cached_watchlist_skips_factor_monitoring_for_speed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            store.add_fund("161725", name="fund 161725")
+            provider = CountingFactorProvider()
+            service = FundValuationService(store=store, provider=provider)
+
+            service.estimate_watchlist_cached(now=TRADING_TIME)
+            for _ in range(100):
+                refreshed = service.estimate_watchlist_cached(now=TRADING_TIME)
+                if refreshed:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("background refresh did not populate cache")
+
+            self.assertEqual(provider.nav_history_calls, 0)
+            service.estimate_watchlist(now=TRADING_TIME)
+
+        self.assertGreater(provider.nav_history_calls, 0)
+
+    def test_cached_watchlist_skips_factor_fallback_for_speed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            store.add_fund("161725", name="fund 161725")
+            provider = UnavailableHoldingCountingFactorProvider()
+            service = FundValuationService(store=store, provider=provider)
+
+            service.estimate_watchlist_cached(now=TRADING_TIME)
+            for _ in range(100):
+                refreshed = service.estimate_watchlist_cached(now=TRADING_TIME)
+                if refreshed:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("background refresh did not populate cache")
+
+            self.assertEqual(refreshed[0]["status"], "unavailable")
+            self.assertEqual(provider.nav_history_calls, 0)
+            service.estimate_watchlist(now=TRADING_TIME)
+
+        self.assertGreater(provider.nav_history_calls, 0)
+
+    def test_cached_watchlist_populates_timeout_rows_when_live_refresh_is_slow(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            store.add_fund("161725", name="fund 161725")
+            provider = BlockingRefreshProvider()
+            service = FundValuationService(
+                store=store,
+                provider=provider,
+                live_refresh_timeout_seconds=0.01,
+            )
+
+            service.estimate_watchlist_cached(now=TRADING_TIME)
+            self.assertTrue(provider.started.wait(timeout=1))
+            for _ in range(100):
+                refreshed = service.estimate_watchlist_cached(now=TRADING_TIME)
+                if refreshed:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("background refresh did not populate timeout cache")
+            provider.release.set()
+
+        self.assertEqual(refreshed[0]["status"], "unavailable")
+        self.assertEqual(refreshed[0]["source"], "refresh")
+        self.assertEqual(refreshed[0]["reason"], "refresh_timeout")
+
+    def test_cached_watchlist_skips_official_estimate_for_speed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            store.add_fund("161725", name="fund 161725")
+            provider = CountingOfficialProvider()
+            service = FundValuationService(store=store, provider=provider)
+
+            service.estimate_watchlist_cached(now=TRADING_TIME)
+            for _ in range(100):
+                refreshed = service.estimate_watchlist_cached(now=TRADING_TIME)
+                if refreshed:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("background refresh did not populate cache")
+
+            self.assertEqual(refreshed[0]["source"], "holding")
+            self.assertEqual(provider.official_calls, 0)
+            full_rows = service.estimate_watchlist(now=TRADING_TIME)
+
+        self.assertEqual(full_rows[0]["source"], "official")
+        self.assertGreater(provider.official_calls, 0)
 
     def test_non_trading_estimate_calculates_when_previous_close_snapshot_is_missing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -390,6 +676,68 @@ class FundValuationServiceTests(unittest.TestCase):
         self.assertAlmostEqual(result["latest_nav"], 1.04)
         self.assertEqual(result["latest_nav_date"], "2026-07-29")
 
+    def test_qdii_nasdaq_uses_overseas_benchmark_and_fx_before_holdings(self):
+        case = self
+
+        class QdiiBenchmarkProvider(FakeProvider):
+            def get_fund_name(self, code):
+                return "建信纳斯达克100指数(QDII)A人民币"
+
+            def get_latest_nav(self, code):
+                return LatestNav(nav=3.3217, date="2026-07-31")
+
+            def get_nav_by_date(self, code, nav_date):
+                return None
+
+            def get_official_estimate(self, code):
+                return None
+
+            def get_qdii_benchmark_quote(self, code, fund_name=None, from_date=None, to_date=None):
+                case.assertEqual(code, "539001")
+                case.assertEqual(fund_name, "建信纳斯达克100指数(QDII)A人民币")
+                case.assertEqual(from_date, "2026-07-31")
+                case.assertEqual(to_date, "2026-08-03")
+                return {
+                    "source": "qdii_benchmark",
+                    "benchmark_symbol": "QQQ",
+                    "benchmark_name": "纳斯达克100/QQQ",
+                    "fx_symbol": "USDCNYC",
+                    "benchmark_growth_pct": 1.76,
+                    "fx_growth_pct": -0.16,
+                    "change_pct": 1.5972,
+                    "benchmark_start_date": "2026-07-31",
+                    "benchmark_end_date": "2026-08-03",
+                    "fx_start_date": "2026-07-31",
+                    "fx_end_date": "2026-08-03",
+                }
+
+            def get_holdings(self, code):
+                raise AssertionError("QDII benchmark should skip holding fallback")
+
+            def get_quotes(self, stock_codes):
+                raise AssertionError("QDII benchmark should skip quote fallback")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=QdiiBenchmarkProvider())
+
+            result = service.estimate_fund("539001", now=datetime(2026, 8, 4, 10, 0, 0))
+
+        self.assertEqual(result["source"], "qdii_benchmark")
+        self.assertEqual(result["trade_date"], "2026-08-03")
+        self.assertEqual(result["target_trade_date"], "2026-08-03")
+        self.assertEqual(result["context_trade_date"], "2026-08-04")
+        self.assertEqual(result["market_phase"], "closed")
+        self.assertTrue(result["is_final"])
+        self.assertAlmostEqual(result["estimate_growth_pct"], 1.5972)
+        self.assertAlmostEqual(result["estimate_nav"], 3.374754)
+        self.assertAlmostEqual(result["latest_nav"], 3.3217)
+        self.assertEqual(result["latest_nav_date"], "2026-07-31")
+        self.assertEqual(result["benchmark_symbol"], "QQQ")
+        self.assertEqual(result["fx_symbol"], "USDCNYC")
+        self.assertAlmostEqual(result["benchmark_growth_pct"], 1.76)
+        self.assertAlmostEqual(result["fx_growth_pct"], -0.16)
+
     def test_etf_link_uses_lower_coverage_floor_for_holding_estimate(self):
         class EtfProvider(FakeProvider):
             def get_fund_name(self, code):
@@ -471,6 +819,93 @@ class FundValuationServiceTests(unittest.TestCase):
         self.assertAlmostEqual(result["uncovered_proxy_growth_pct"], 1.2)
         self.assertAlmostEqual(result["estimate_growth_pct"], 1.0)
         self.assertAlmostEqual(result["estimate_nav"], 1.01)
+
+    def test_active_holding_estimate_blends_uncovered_weight_with_holding_momentum(self):
+        class ActiveMomentumProvider(FakeProvider):
+            def get_fund_name(self, code):
+                return "信澳业绩驱动混合A"
+
+            def get_holdings(self, code):
+                return [
+                    Holding(name="A", code="300001", weight_pct=15.0),
+                    Holding(name="B", code="300002", weight_pct=15.0),
+                    Holding(name="C", code="300003", weight_pct=15.0),
+                    Holding(name="D", code="300004", weight_pct=15.0),
+                ]
+
+            def get_quotes(self, stock_codes):
+                return {
+                    code: Quote(code=code, name=code, change_pct=10.0)
+                    for code in stock_codes
+                }
+
+            def get_nav_history(self, code, limit=120):
+                return factor_points(1.0, [1.0] * 24)
+
+            def get_factor_histories(self, limit=120):
+                return {
+                    "sh000300": factor_points(100.0, [1.0] * 24),
+                }
+
+            def get_factor_quotes(self, factor_codes):
+                return {"sh000300": Quote(code="sh000300", name="CSI 300", change_pct=1.0)}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=ActiveMomentumProvider())
+
+            result = service.estimate_fund("016370", now=TRADING_TIME)
+
+        self.assertEqual(result["source"], "holding")
+        self.assertAlmostEqual(result["raw_holding_estimate_growth_pct"], 10.0)
+        self.assertAlmostEqual(result["covered_contribution_pct"], 6.0)
+        self.assertAlmostEqual(result["uncovered_weight_pct"], 40.0)
+        self.assertEqual(result["uncovered_proxy_source"], "holding_momentum_blend")
+        self.assertAlmostEqual(result["holding_momentum_growth_pct"], 10.0)
+        self.assertAlmostEqual(result["uncovered_proxy_growth_pct"], 6.85)
+        self.assertAlmostEqual(result["fit_growth_pct"], 1.0, places=3)
+        self.assertAlmostEqual(result["estimate_growth_pct"], 8.74)
+
+    def test_etf_link_blends_uncovered_weight_with_tracking_index_before_factor_fit(self):
+        class TrackingIndexProvider(FakeProvider):
+            def get_fund_name(self, code):
+                return "天弘中证银行ETF联接C"
+
+            def get_holdings(self, code):
+                return [Holding(name="招商银行", code="600036", weight_pct=1.19)]
+
+            def get_quotes(self, stock_codes):
+                return {"600036": Quote(code="600036", name="招商银行", change_pct=-2.8)}
+
+            def get_nav_history(self, code, limit=120):
+                return factor_points(1.0, [1.0] * 24)
+
+            def get_factor_histories(self, limit=120):
+                return {
+                    "sh000300": factor_points(100.0, [1.0] * 24),
+                }
+
+            def get_factor_quotes(self, factor_codes):
+                return {"sh000300": Quote(code="sh000300", name="CSI 300", change_pct=-1.3)}
+
+            def get_tracking_index_quote(self, code, fund_name=None):
+                return Quote(code="sz399986", name="中证银行", change_pct=-2.56)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=TrackingIndexProvider())
+
+            result = service.estimate_fund("001595", now=TRADING_TIME)
+
+        self.assertEqual(result["source"], "holding")
+        self.assertAlmostEqual(result["raw_holding_estimate_growth_pct"], -2.8)
+        self.assertAlmostEqual(result["covered_contribution_pct"], -0.0333)
+        self.assertAlmostEqual(result["uncovered_weight_pct"], 98.81)
+        self.assertEqual(result["uncovered_proxy_source"], "tracking_index")
+        self.assertEqual(result["uncovered_proxy_name"], "中证银行")
+        self.assertAlmostEqual(result["uncovered_proxy_growth_pct"], -2.56)
+        self.assertAlmostEqual(result["fit_growth_pct"], -1.3, places=3)
+        self.assertAlmostEqual(result["estimate_growth_pct"], -2.5628)
 
     def test_holding_estimate_marks_high_risk_and_reduces_confidence_for_volatile_holdings(self):
         class VolatileHoldingProvider(FakeProvider):
@@ -713,6 +1148,17 @@ class FundValuationServiceTests(unittest.TestCase):
 
         self.assertIsNone(saturday)
         self.assertIsNone(sunday)
+
+    def test_refresh_window_extends_until_snapshot_save_time(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=FakeProvider())
+
+            before_snapshot = service.trading_status(datetime(2026, 7, 31, 15, 4, 0))
+            after_snapshot = service.trading_status(datetime(2026, 7, 31, 15, 6, 0))
+
+        self.assertTrue(before_snapshot["is_refresh_window"])
+        self.assertFalse(after_snapshot["is_refresh_window"])
 
     def test_trading_day_uses_provider_calendar_when_available(self):
         class CalendarProvider(FakeProvider):
