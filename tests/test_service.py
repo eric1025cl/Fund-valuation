@@ -852,6 +852,48 @@ class FundValuationServiceTests(unittest.TestCase):
         self.assertAlmostEqual(result["estimate_growth_pct"], 1.0)
         self.assertAlmostEqual(result["estimate_nav"], 1.01)
 
+    def test_divergent_factor_proxy_is_shrunk_toward_raw_holding_estimate(self):
+        class DivergentFactorProvider(FakeProvider):
+            def get_holdings(self, code):
+                return [
+                    Holding(name="A", code="300001", weight_pct=20.0),
+                    Holding(name="B", code="300002", weight_pct=20.0),
+                    Holding(name="C", code="300003", weight_pct=20.0),
+                ]
+
+            def get_quotes(self, stock_codes):
+                return {
+                    code: Quote(code=code, name=code, change_pct=1.0)
+                    for code in stock_codes
+                }
+
+            def get_nav_history(self, code, limit=120):
+                return factor_points(1.0, [5.0] * 24)
+
+            def get_factor_histories(self, limit=120):
+                return {
+                    "sh000300": factor_points(100.0, [5.0] * 24),
+                }
+
+            def get_factor_quotes(self, factor_codes):
+                return {"sh000300": Quote(code="sh000300", name="CSI 300", change_pct=5.0)}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=DivergentFactorProvider())
+
+            result = service.estimate_fund("016370", now=TRADING_TIME)
+
+        self.assertEqual(result["source"], "holding")
+        self.assertAlmostEqual(result["raw_holding_estimate_growth_pct"], 1.0)
+        self.assertAlmostEqual(result["uncovered_proxy_growth_pct"], 5.0)
+        self.assertIsNotNone(result.get("uncovered_proxy_structural_growth_pct"))
+        self.assertIsNotNone(result.get("uncovered_proxy_shrink_weight_pct"))
+        self.assertAlmostEqual(result.get("uncovered_proxy_structural_growth_pct"), 2.6)
+        self.assertAlmostEqual(result.get("uncovered_proxy_shrink_weight_pct"), 25.0)
+        self.assertAlmostEqual(result["estimate_growth_pct"], 1.4)
+        self.assertAlmostEqual(result["estimate_nav"], 1.014)
+
     def test_active_holding_estimate_blends_uncovered_weight_with_holding_momentum(self):
         class ActiveMomentumProvider(FakeProvider):
             def get_fund_name(self, code):
@@ -938,6 +980,71 @@ class FundValuationServiceTests(unittest.TestCase):
         self.assertAlmostEqual(result["uncovered_proxy_growth_pct"], -2.56)
         self.assertAlmostEqual(result["fit_growth_pct"], -1.3, places=3)
         self.assertAlmostEqual(result["estimate_growth_pct"], -2.5628)
+
+    def test_low_coverage_etf_link_shrinks_divergent_tracking_index_proxy(self):
+        class DivergentTrackingIndexProvider(FakeProvider):
+            def get_fund_name(self, code):
+                return "天弘中证银行ETF联接C"
+
+            def get_holdings(self, code):
+                return [Holding(name="招商银行", code="600036", weight_pct=1.19)]
+
+            def get_quotes(self, stock_codes):
+                return {"600036": Quote(code="600036", name="招商银行", change_pct=-1.0)}
+
+            def get_tracking_index_quote(self, code, fund_name=None):
+                return Quote(code="sz399986", name="中证银行", change_pct=-3.0)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=DivergentTrackingIndexProvider())
+
+            result = service.estimate_fund("001595", now=TRADING_TIME)
+
+        self.assertEqual(result["source"], "holding")
+        self.assertAlmostEqual(result["raw_holding_estimate_growth_pct"], -1.0)
+        self.assertAlmostEqual(result["uncovered_proxy_growth_pct"], -3.0)
+        self.assertIsNotNone(result.get("uncovered_proxy_structural_growth_pct"))
+        self.assertIsNotNone(result.get("uncovered_proxy_shrink_weight_pct"))
+        self.assertAlmostEqual(result.get("uncovered_proxy_structural_growth_pct"), -2.9762)
+        self.assertAlmostEqual(result.get("uncovered_proxy_shrink_weight_pct"), 25.0)
+        self.assertAlmostEqual(result["estimate_growth_pct"], -1.4941)
+        self.assertAlmostEqual(result["estimate_nav"], 0.985059)
+
+    def test_etf_link_uses_target_etf_proxy_without_divergence_shrink(self):
+        class TargetEtfProvider(FakeProvider):
+            def get_fund_name(self, code):
+                return "广发中证军工ETF联接C"
+
+            def get_holdings(self, code):
+                return [Holding(name="中国船舶", code="600150", weight_pct=1.6)]
+
+            def get_quotes(self, stock_codes):
+                return {"600150": Quote(code="600150", name="中国船舶", change_pct=-0.7)}
+
+            def get_tracking_index_quote(self, code, fund_name=None):
+                return Quote(
+                    code="512680",
+                    name="军工ETF广发",
+                    change_pct=0.26,
+                    quote_time="2026-08-06 09:57:18",
+                    trade_date="2026-08-06",
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=TargetEtfProvider())
+
+            result = service.estimate_fund("005693", now=TRADING_TIME)
+
+        self.assertEqual(result["source"], "holding")
+        self.assertAlmostEqual(result["raw_holding_estimate_growth_pct"], -0.7)
+        self.assertEqual(result["uncovered_proxy_source"], "target_etf")
+        self.assertEqual(result["uncovered_proxy_name"], "军工ETF广发")
+        self.assertAlmostEqual(result["uncovered_proxy_growth_pct"], 0.26)
+        self.assertAlmostEqual(result["uncovered_proxy_shrink_weight_pct"], 100.0)
+        self.assertAlmostEqual(result["estimate_growth_pct"], 0.2446)
+        self.assertAlmostEqual(result["estimate_nav"], 1.002446)
 
     def test_holding_estimate_marks_high_risk_and_reduces_confidence_for_volatile_holdings(self):
         class VolatileHoldingProvider(FakeProvider):

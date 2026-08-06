@@ -124,14 +124,22 @@ class FakeTrackingIndexAk:
         return pd.DataFrame(columns=["代码", "名称", "涨跌幅"])
 
     def stock_zh_index_daily(self, symbol):
-        if symbol != "sz399986":
+        if symbol == "sz399986":
+            return pd.DataFrame(
+                [
+                    {"date": "2026-08-03", "close": 100.0},
+                    {"date": "2026-08-04", "close": 97.44},
+                ]
+            )
+        if symbol == "sh931151":
+            return pd.DataFrame(
+                [
+                    {"date": "2026-08-03", "close": 100.0},
+                    {"date": "2026-08-04", "close": 103.0},
+                ]
+            )
+        else:
             raise AssertionError(f"unexpected tracking index symbol {symbol}")
-        return pd.DataFrame(
-            [
-                {"date": "2026-08-03", "close": 100.0},
-                {"date": "2026-08-04", "close": 97.44},
-            ]
-        )
 
 
 class FakeQdiiBenchmarkAk:
@@ -226,6 +234,23 @@ class TencentQuoteProvider(AkshareProvider):
 
     def _ak(self):
         raise AssertionError("akshare fallback should not be needed")
+
+
+class TargetEtfTencentProvider(AkshareProvider):
+    def __init__(self):
+        super().__init__()
+        self.queries = []
+
+    def _fetch_tencent_quote_text(self, query):
+        self.queries.append(query)
+        return """
+        v_sh515290="1~银行ETF天弘~515290~1.432~1.440~1.441~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~20260806095719~-0.008~-0.56~";
+        v_sh512680="1~军工ETF广发~512680~1.164~1.161~1.156~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~20260806095718~0.003~0.26~";
+        v_sh516150="1~稀土ETF嘉实~516150~1.778~1.749~1.761~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~20260806100737~0.029~1.66~";
+        """
+
+    def _ak(self):
+        raise AssertionError("target ETF quote should use Tencent realtime data")
 
 
 class TestableProvider(AkshareProvider):
@@ -436,6 +461,43 @@ class AkshareProviderTests(unittest.TestCase):
         self.assertEqual(quote.name, "中证银行")
         self.assertAlmostEqual(quote.change_pct, -2.56)
         self.assertIsNone(quote.quote_time)
+        self.assertEqual(quote.trade_date, "2026-08-04")
+
+    def test_tracking_index_quote_prefers_target_etf_realtime_quote(self):
+        provider = TargetEtfTencentProvider()
+
+        bank_quote = provider.get_tracking_index_quote("001595", fund_name="天弘中证银行ETF联接C")
+        defense_quote = provider.get_tracking_index_quote("005693", fund_name="广发中证军工ETF联接C")
+        rare_earth_quote = provider.get_tracking_index_quote("011036", fund_name="嘉实中证稀土产业ETF联接C")
+
+        self.assertIsNotNone(bank_quote)
+        self.assertEqual(bank_quote.code, "515290")
+        self.assertEqual(bank_quote.name, "银行ETF天弘")
+        self.assertAlmostEqual(bank_quote.change_pct, -0.56)
+        self.assertEqual(bank_quote.trade_date, "2026-08-06")
+        self.assertIsNotNone(defense_quote)
+        self.assertEqual(defense_quote.code, "512680")
+        self.assertEqual(defense_quote.name, "军工ETF广发")
+        self.assertAlmostEqual(defense_quote.change_pct, 0.26)
+        self.assertEqual(defense_quote.trade_date, "2026-08-06")
+        self.assertIsNotNone(rare_earth_quote)
+        self.assertEqual(rare_earth_quote.code, "516150")
+        self.assertEqual(rare_earth_quote.name, "稀土ETF嘉实")
+        self.assertAlmostEqual(rare_earth_quote.change_pct, 1.66)
+        self.assertEqual(rare_earth_quote.trade_date, "2026-08-06")
+        self.assertIn("sh515290", provider.queries[0])
+        self.assertIn("sh512680", provider.queries[1])
+        self.assertIn("sh516150", provider.queries[2])
+
+    def test_tracking_index_quote_maps_photovoltaic_index_fund(self):
+        provider = TestableProvider(FakeTrackingIndexAk())
+
+        quote = provider.get_tracking_index_quote("011103", fund_name="天弘中证光伏产业指数C")
+
+        self.assertIsNotNone(quote)
+        self.assertEqual(quote.code, "sh931151")
+        self.assertEqual(quote.name, "中证光伏产业")
+        self.assertAlmostEqual(quote.change_pct, 3.0)
         self.assertEqual(quote.trade_date, "2026-08-04")
 
     def test_qdii_benchmark_quote_combines_nasdaq_proxy_and_fx(self):

@@ -120,6 +120,7 @@ class StaticPageTests(unittest.TestCase):
         self.assertIn("function estimateExplanationItems", js)
         self.assertIn("fund-explanation", js)
         self.assertIn("uncovered_proxy_name", js)
+        self.assertIn("用目标ETF", js)
         self.assertIn("用跟踪指数", js)
         self.assertIn("用持仓动量混合", js)
         self.assertIn("qdii_benchmark", js)

@@ -23,6 +23,8 @@ SNAPSHOT_REPAIR_INTERVAL = timedelta(minutes=10)
 RECONCILIATION_RETRY_INTERVAL = timedelta(minutes=30)
 SNAPSHOT_SAVE_MINUTE = 15 * 60 + 5
 LIVE_REFRESH_CACHE_TTL = timedelta(minutes=10)
+DIVERGENT_PROXY_GAP_PCT = 0.75
+DIVERGENT_PROXY_SHRINK_WEIGHT = 0.25
 
 
 class FundDataProvider(Protocol):
@@ -650,7 +652,7 @@ class FundValuationService:
         factor_growth = None
         proxy_growth = _number_or_none(getattr(tracking_quote, "change_pct", None))
         if proxy_growth is not None:
-            proxy_source = "tracking_index"
+            proxy_source = _tracking_proxy_source(tracking_quote)
             proxy_name = getattr(tracking_quote, "name", None)
         elif factor_result is not None and getattr(factor_result, "status", None) == "estimated":
             factor_data = factor_result.to_dict()
@@ -692,7 +694,15 @@ class FundValuationService:
             result["holding_momentum_growth_pct"] = round(momentum_proxy["momentum_growth"], 4)
             result["uncovered_proxy_momentum_weight_pct"] = round(momentum_proxy["momentum_weight"] * 100.0, 1)
 
-        blended_growth = covered_contribution + proxy_growth * uncovered_weight / 100.0
+        structural_growth = covered_contribution + proxy_growth * uncovered_weight / 100.0
+        shrink_weight = _uncovered_proxy_shrink_weight(
+            proxy_source=proxy_source,
+            raw_growth=raw_growth,
+            structural_growth=structural_growth,
+        )
+        blended_growth = structural_growth
+        if raw_growth is not None and shrink_weight < 1.0:
+            blended_growth = raw_growth + (structural_growth - raw_growth) * shrink_weight
         result["raw_holding_estimate_nav"] = result.get("estimate_nav")
         result["raw_holding_estimate_growth_pct"] = round(raw_growth, 4) if raw_growth is not None else None
         result["covered_contribution_pct"] = round(covered_contribution, 4)
@@ -701,6 +711,8 @@ class FundValuationService:
         if proxy_name:
             result["uncovered_proxy_name"] = str(proxy_name)
         result["uncovered_proxy_growth_pct"] = round(proxy_growth, 4)
+        result["uncovered_proxy_structural_growth_pct"] = round(structural_growth, 4)
+        result["uncovered_proxy_shrink_weight_pct"] = round(shrink_weight * 100.0, 1)
         result["estimate_growth_pct"] = round(blended_growth, 4)
         result["estimate_nav"] = round(latest_nav * (1 + blended_growth / 100.0), 6)
 
@@ -1141,6 +1153,27 @@ def _holding_momentum_proxy_growth(
         "momentum_growth": raw_growth,
         "momentum_weight": momentum_weight,
     }
+
+
+def _tracking_proxy_source(quote: Quote | None) -> str:
+    name = str(getattr(quote, "name", "") or "").upper()
+    if "ETF" in name:
+        return "target_etf"
+    return "tracking_index"
+
+
+def _uncovered_proxy_shrink_weight(
+    proxy_source: str | None,
+    raw_growth: float | None,
+    structural_growth: float,
+) -> float:
+    if proxy_source not in {"tracking_index", "factor_fit"}:
+        return 1.0
+    if raw_growth is None:
+        return 1.0
+    if abs(structural_growth - raw_growth) < DIVERGENT_PROXY_GAP_PCT:
+        return 1.0
+    return DIVERGENT_PROXY_SHRINK_WEIGHT
 
 
 def _is_usable_snapshot_row(row: dict) -> bool:

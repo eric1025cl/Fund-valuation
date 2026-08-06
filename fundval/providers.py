@@ -18,11 +18,24 @@ TRACKING_INDEX_BY_FUND_CODE = {
     "001595": ("sz399986", "中证银行"),
     "005693": ("sz399967", "中证军工"),
     "012414": ("sz399997", "中证白酒"),
+    "011103": ("sh931151", "中证光伏产业"),
+}
+TARGET_ETF_BY_FUND_CODE = {
+    "001595": ("515290", "天弘中证银行ETF"),
+    "005693": ("512680", "广发中证军工ETF"),
+    "011036": ("516150", "嘉实中证稀土产业ETF"),
 }
 TRACKING_INDEX_BY_FUND_NAME = (
     ("中证银行", "sz399986", "中证银行"),
     ("中证军工", "sz399967", "中证军工"),
     ("中证白酒", "sz399997", "中证白酒"),
+    ("中证光伏产业", "sh931151", "中证光伏产业"),
+    ("光伏产业", "sh931151", "中证光伏产业"),
+)
+TARGET_ETF_BY_FUND_NAME = (
+    ("天弘中证银行ETF联接", "515290", "天弘中证银行ETF"),
+    ("广发中证军工ETF联接", "512680", "广发中证军工ETF"),
+    ("嘉实中证稀土产业ETF联接", "516150", "嘉实中证稀土产业ETF"),
 )
 QDII_BENCHMARK_BY_FUND_CODE = {
     "539001": {
@@ -338,6 +351,20 @@ class AkshareProvider:
         return quotes
 
     def get_tracking_index_quote(self, code: str, fund_name: str | None = None) -> Quote | None:
+        target_etf = _target_etf_for_fund(code, fund_name)
+        if target_etf is not None:
+            etf_code, etf_name = target_etf
+            quote = self._cached(
+                f"target_etf_quote:{etf_code}",
+                lambda current_code=etf_code, current_name=etf_name: self._fetch_target_etf_quote(
+                    current_code,
+                    current_name,
+                ),
+                timedelta(seconds=60),
+            )
+            if quote is not None:
+                return quote
+
         index = _tracking_index_for_fund(code, fund_name)
         if index is None:
             return None
@@ -359,6 +386,18 @@ class AkshareProvider:
         if quote is not None:
             return quote
         return self._factor_quote_from_history(index_code, index_name)
+
+    def _fetch_target_etf_quote(self, etf_code: str, etf_name: str) -> Quote | None:
+        quote = self._get_tencent_quotes({_normalize_stock_code(etf_code)}).get(_normalize_stock_code(etf_code))
+        if quote is None:
+            return None
+        return Quote(
+            code=_normalize_stock_code(etf_code),
+            name=quote.name or etf_name,
+            change_pct=quote.change_pct,
+            quote_time=quote.quote_time,
+            trade_date=quote.trade_date,
+        )
 
     def get_qdii_benchmark_quote(
         self,
@@ -700,6 +739,19 @@ def _tracking_index_for_fund(code: str, fund_name: str | None) -> tuple[str, str
     for marker, index_code, index_name in TRACKING_INDEX_BY_FUND_NAME:
         if marker in name:
             return index_code, index_name
+    return None
+
+
+def _target_etf_for_fund(code: str, fund_name: str | None) -> tuple[str, str] | None:
+    fund_code = _normalize_stock_code(code)
+    if fund_code in TARGET_ETF_BY_FUND_CODE:
+        return TARGET_ETF_BY_FUND_CODE[fund_code]
+    name = str(fund_name or "")
+    if "ETF联接" not in name and "ETF聯接" not in name:
+        return None
+    for marker, etf_code, etf_name in TARGET_ETF_BY_FUND_NAME:
+        if marker in name:
+            return etf_code, etf_name
     return None
 
 

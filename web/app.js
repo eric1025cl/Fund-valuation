@@ -647,6 +647,9 @@ function estimateRiskLabel(item) {
 }
 
 function uncoveredProxyLabel(item) {
+  if (item.uncovered_proxy_source === "target_etf") {
+    return item.uncovered_proxy_name ? `用目标ETF ${item.uncovered_proxy_name}` : "用目标ETF";
+  }
   if (item.uncovered_proxy_source === "tracking_index") {
     return item.uncovered_proxy_name ? `用跟踪指数 ${item.uncovered_proxy_name}` : "用跟踪指数";
   }
