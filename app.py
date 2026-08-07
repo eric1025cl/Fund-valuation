@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from contextlib import suppress
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from fundval.store import WatchlistStore
 ROOT_DIR = Path(__file__).resolve().parent
 WEB_DIR = ROOT_DIR / "web"
 DATA_DIR = ROOT_DIR / "data"
+DATA_DIR_ENV = "FUNDVAL_DATA_DIR"
 
 
 class FundRequest(BaseModel):
@@ -31,10 +33,12 @@ class SnapshotRequest(BaseModel):
 def create_app(
     service: FundValuationService | None = None,
     enable_scheduler: bool | None = None,
+    data_dir: Path | str | None = None,
 ) -> FastAPI:
-    valuation_service = service or _default_service()
+    valuation_service = service or _default_service(data_dir=data_dir)
     should_schedule = (service is None) if enable_scheduler is None else enable_scheduler
     api = FastAPI(title="Fund Valuation", version="0.1.0")
+    api.state.valuation_service = valuation_service
 
     if WEB_DIR.exists():
         api.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
@@ -125,8 +129,9 @@ def create_app(
     return api
 
 
-def _default_service() -> FundValuationService:
-    store = WatchlistStore(DATA_DIR / "funds.db")
+def _default_service(data_dir: Path | str | None = None) -> FundValuationService:
+    resolved_data_dir = Path(data_dir or os.environ.get(DATA_DIR_ENV) or DATA_DIR)
+    store = WatchlistStore(resolved_data_dir / "funds.db")
     provider = AkshareProvider()
     return FundValuationService(store=store, provider=provider)
 

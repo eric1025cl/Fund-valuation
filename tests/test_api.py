@@ -49,6 +49,14 @@ class FakeProvider:
 
 
 class ApiTests(unittest.TestCase):
+    def test_create_app_accepts_explicit_data_dir(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir) / "desktop-data"
+            app = create_app(enable_scheduler=False, data_dir=data_dir)
+            store = app.state.valuation_service.store
+
+        self.assertEqual(store.db_path, data_dir / "funds.db")
+
     def test_add_list_estimate_and_delete_fund(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             service = FundValuationService(
