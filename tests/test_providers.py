@@ -164,6 +164,38 @@ class FakeQdiiBenchmarkAk:
         )
 
 
+class FakeHistoricalQuoteAk:
+    def stock_us_daily(self, symbol):
+        if symbol != "CIEN":
+            raise AssertionError(f"unexpected US symbol {symbol}")
+        return pd.DataFrame(
+            [
+                {"date": "2026-08-04", "close": 100.0},
+                {"date": "2026-08-05", "close": 102.0},
+            ]
+        )
+
+    def stock_hk_daily(self, symbol):
+        if symbol != "01888":
+            raise AssertionError(f"unexpected HK symbol {symbol}")
+        return pd.DataFrame(
+            [
+                {"date": "2026-08-04", "close": 20.0},
+                {"date": "2026-08-05", "close": 19.0},
+            ]
+        )
+
+    def stock_zh_a_hist(self, symbol, period, adjust):
+        if symbol != "300750":
+            raise AssertionError(f"unexpected A-share symbol {symbol}")
+        return pd.DataFrame(
+            [
+                {"日期": "2026-08-04", "收盘": 200.0},
+                {"日期": "2026-08-05", "收盘": 210.0},
+            ]
+        )
+
+
 class SlowFactorHistoryAk:
     def __init__(self):
         self.active = 0
@@ -401,6 +433,20 @@ class AkshareProviderTests(unittest.TestCase):
         self.assertEqual(quotes["SNDK"].name, "闪迪")
         self.assertAlmostEqual(quotes["SNDK"].change_pct, 25.99)
         self.assertAlmostEqual(quotes["920368"].change_pct, -0.57)
+
+    def test_historical_quotes_calculate_interval_returns_by_market(self):
+        provider = TestableProvider(FakeHistoricalQuoteAk())
+
+        quotes = provider.get_historical_quotes(
+            ["CIEN", "01888", "300750"],
+            from_date="2026-08-04",
+            to_date="2026-08-05",
+        )
+
+        self.assertAlmostEqual(quotes["CIEN"].change_pct, 2.0)
+        self.assertEqual(quotes["CIEN"].trade_date, "2026-08-05")
+        self.assertAlmostEqual(quotes["01888"].change_pct, -5.0)
+        self.assertAlmostEqual(quotes["300750"].change_pct, 5.0)
 
     def test_tencent_symbol_supports_beijing_exchange_codes(self):
         self.assertEqual(_tencent_symbol("920368"), "bj920368")

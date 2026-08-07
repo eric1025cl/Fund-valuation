@@ -770,6 +770,63 @@ class FundValuationServiceTests(unittest.TestCase):
         self.assertAlmostEqual(result["benchmark_growth_pct"], 1.76)
         self.assertAlmostEqual(result["fx_growth_pct"], -0.16)
 
+    def test_qdii_holding_estimate_uses_target_date_historical_quotes(self):
+        class ActiveQdiiProvider(FakeProvider):
+            def __init__(self):
+                super().__init__()
+                self.realtime_quote_calls = 0
+                self.historical_quote_calls = []
+
+            def get_fund_name(self, code):
+                return "华夏全球科技先锋混合(QDII)C"
+
+            def get_latest_nav(self, code):
+                return LatestNav(nav=2.0, date="2026-08-04")
+
+            def get_nav_by_date(self, code, nav_date):
+                return None
+
+            def get_official_estimate(self, code):
+                return None
+
+            def get_qdii_benchmark_quote(self, code, fund_name=None, from_date=None, to_date=None):
+                return None
+
+            def get_holdings(self, code):
+                return [
+                    Holding(name="Ciena", code="CIEN", weight_pct=50.0),
+                    Holding(name="TSMC", code="TSM", weight_pct=50.0),
+                ]
+
+            def get_quotes(self, stock_codes):
+                self.realtime_quote_calls += 1
+                return {
+                    "CIEN": Quote(code="CIEN", name="Ciena", change_pct=-10.0, trade_date="2026-08-06"),
+                    "TSM": Quote(code="TSM", name="TSMC", change_pct=-10.0, trade_date="2026-08-06"),
+                }
+
+            def get_historical_quotes(self, stock_codes, from_date=None, to_date=None):
+                self.historical_quote_calls.append((tuple(stock_codes), from_date, to_date))
+                return {
+                    "CIEN": Quote(code="CIEN", name="Ciena", change_pct=2.0, trade_date="2026-08-05"),
+                    "TSM": Quote(code="TSM", name="TSMC", change_pct=-1.0, trade_date="2026-08-05"),
+                }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = ActiveQdiiProvider()
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=provider)
+
+            result = service.estimate_fund("024239", now=datetime(2026, 8, 6, 10, 0, 0))
+
+        self.assertEqual(provider.realtime_quote_calls, 0)
+        self.assertEqual(provider.historical_quote_calls, [(("CIEN", "TSM"), "2026-08-04", "2026-08-05")])
+        self.assertEqual(result["source"], "holding")
+        self.assertEqual(result["trade_date"], "2026-08-05")
+        self.assertAlmostEqual(result["estimate_growth_pct"], 0.5)
+        self.assertAlmostEqual(result["estimate_nav"], 2.01)
+        self.assertEqual([item["change_pct"] for item in result["contributions"]], [2.0, -1.0])
+
     def test_etf_link_uses_lower_coverage_floor_for_holding_estimate(self):
         class EtfProvider(FakeProvider):
             def get_fund_name(self, code):

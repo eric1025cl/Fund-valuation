@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass
 from typing import Optional
 
@@ -263,5 +264,12 @@ def _date_from_text(value) -> str:
 
 
 def _normalize_stock_code(code: str) -> str:
-    digits = "".join(ch for ch in str(code or "") if ch.isdigit())
+    raw = str(code or "").strip().upper()
+    if "." in raw:
+        left, right = raw.split(".", 1)
+        raw = left if any(ch.isalpha() for ch in left) else right
+    token = re.sub(r"[^0-9A-Z]", "", raw)
+    if any(ch.isalpha() for ch in token):
+        return token
+    digits = "".join(ch for ch in token if ch.isdigit())
     return digits[-6:] if len(digits) >= 6 else digits

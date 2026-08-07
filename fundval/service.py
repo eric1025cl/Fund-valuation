@@ -333,7 +333,7 @@ class FundValuationService:
             return self._with_calibrated_confidence(fund_code, qdii_benchmark_result)
 
         holdings = self._safe_call(lambda: self.provider.get_holdings(fund_code)) or []
-        quotes = self._safe_call(lambda: self.provider.get_quotes([h.code for h in holdings])) or {}
+        quotes = self._holding_quotes(name or "", holdings, latest_nav, target_trade_date)
         result = calculate_holding_estimate(
             latest_nav=latest_nav,
             holdings=holdings,
@@ -377,6 +377,27 @@ class FundValuationService:
             holding_trade_date = target_trade_date
         self._attach_valuation_context(result, context, trade_date=holding_trade_date or target_trade_date)
         return self._with_calibrated_confidence(fund_code, result)
+
+    def _holding_quotes(
+        self,
+        fund_name: str,
+        holdings: list[Holding],
+        latest_nav: LatestNav | None,
+        target_trade_date: str,
+    ) -> dict[str, Quote]:
+        holding_codes = [h.code for h in holdings]
+        latest_nav_date = _date_key(latest_nav.date) if latest_nav is not None else ""
+        if _is_qdii_name(fund_name) and latest_nav_date and target_trade_date and latest_nav_date < target_trade_date:
+            get_historical_quotes = getattr(self.provider, "get_historical_quotes", None)
+            if callable(get_historical_quotes):
+                return self._safe_call(
+                    lambda: get_historical_quotes(
+                        holding_codes,
+                        from_date=latest_nav_date,
+                        to_date=target_trade_date,
+                    )
+                ) or {}
+        return self._safe_call(lambda: self.provider.get_quotes(holding_codes)) or {}
 
     def create_snapshot(
         self,

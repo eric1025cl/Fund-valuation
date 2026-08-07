@@ -31,6 +31,24 @@ class HoldingEstimateTests(unittest.TestCase):
         self.assertAlmostEqual(result.estimate_growth_pct, 0.8)
         self.assertAlmostEqual(result.estimate_nav, 1.2096)
 
+    def test_preserves_alphabetic_holding_codes(self):
+        result = calculate_holding_estimate(
+            latest_nav=LatestNav(nav=1.0, date="2026-08-04"),
+            holdings=[
+                Holding(name="Ciena", code="CIEN", weight_pct=50.0),
+                Holding(name="TSMC", code="TSM", weight_pct=50.0),
+            ],
+            quotes={
+                "CIEN": Quote(code="CIEN", name="Ciena", change_pct=2.0),
+                "TSM": Quote(code="TSM", name="TSMC", change_pct=-1.0),
+            },
+        )
+
+        self.assertEqual(result.status, "estimated")
+        self.assertAlmostEqual(result.estimate_growth_pct, 0.5)
+        self.assertEqual([item.code for item in result.contributions], ["CIEN", "TSM"])
+        self.assertEqual([item.change_pct for item in result.contributions], [2.0, -1.0])
+
     def test_returns_unavailable_when_quote_coverage_is_too_low(self):
         result = calculate_holding_estimate(
             latest_nav=LatestNav(nav=1.0, date="2026-07-30"),

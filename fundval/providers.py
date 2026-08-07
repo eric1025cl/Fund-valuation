@@ -307,6 +307,29 @@ class AkshareProvider:
                 break
         return result
 
+    def get_historical_quotes(
+        self,
+        stock_codes: list[str],
+        from_date: str | None = None,
+        to_date: str | None = None,
+    ) -> dict[str, Quote]:
+        start_key = _date_key(from_date)
+        end_key = _date_key(to_date)
+        codes = [_normalize_stock_code(code) for code in stock_codes if code]
+        if not codes or not start_key or not end_key or start_key >= end_key:
+            return {}
+
+        def load_quote(code: str):
+            return code, self._historical_quote(code, start_key, end_key)
+
+        worker_count = min(4, len(codes))
+        if worker_count <= 1:
+            loaded = [load_quote(code) for code in codes]
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                loaded = list(executor.map(load_quote, codes))
+        return {code: quote for code, quote in loaded if quote is not None}
+
     def get_factor_histories(self, limit: int = 120) -> dict[str, list[FactorPoint]]:
         result: dict[str, list[FactorPoint]] = {}
         row_limit = max(2, int(limit or 120))
@@ -459,6 +482,22 @@ class AkshareProvider:
             value_names=("close", "收盘", "收盘价", "最新价"),
         )
 
+    def _fetch_hk_symbol_history(self, symbol: str) -> list[FactorPoint]:
+        df = self._ak().stock_hk_daily(symbol=symbol)
+        return _points_from_dataframe(
+            df,
+            date_names=("date", "日期", "trade_date"),
+            value_names=("close", "收盘", "收盘价", "最新价"),
+        )
+
+    def _fetch_a_symbol_history(self, symbol: str) -> list[FactorPoint]:
+        df = self._ak().stock_zh_a_hist(symbol=symbol, period="daily", adjust="")
+        return _points_from_dataframe(
+            df,
+            date_names=("日期", "date", "trade_date"),
+            value_names=("收盘", "close", "收盘价", "最新价"),
+        )
+
     def _fetch_fx_history(self, symbol: str) -> list[FactorPoint]:
         df = self._ak().forex_hist_em(symbol=symbol)
         return _points_from_dataframe(
@@ -544,6 +583,34 @@ class AkshareProvider:
             date_names=("date", "日期", "trade_date"),
             value_names=("close", "收盘", "收盘价"),
         )
+
+    def _historical_quote(self, code: str, from_date: str, to_date: str) -> Quote | None:
+        try:
+            points = self._cached(
+                f"stock_history:{code}",
+                lambda current=code: self._fetch_stock_history(current),
+                STATIC_DAY_CACHE_TTL,
+                current_day_only=True,
+            ) or []
+        except Exception:
+            return None
+        start = _point_on_or_before(points, from_date)
+        end = _point_on_or_before(points, to_date)
+        if start is None or end is None or start.value <= 0 or start.date >= end.date:
+            return None
+        return Quote(
+            code=code,
+            name=code,
+            change_pct=(end.value / start.value - 1) * 100.0,
+            trade_date=end.date,
+        )
+
+    def _fetch_stock_history(self, code: str) -> list[FactorPoint]:
+        if any(ch.isalpha() for ch in code):
+            return self._fetch_us_symbol_history(code)
+        if len(code) == 5:
+            return self._fetch_hk_symbol_history(code)
+        return self._fetch_a_symbol_history(code)
 
     def _fetch_factor_quotes(self) -> dict[str, Quote]:
         ak = self._ak()
