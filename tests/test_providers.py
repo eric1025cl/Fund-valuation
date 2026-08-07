@@ -279,6 +279,7 @@ class TargetEtfTencentProvider(AkshareProvider):
         v_sh515290="1~银行ETF天弘~515290~1.432~1.440~1.441~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~20260806095719~-0.008~-0.56~";
         v_sh512680="1~军工ETF广发~512680~1.164~1.161~1.156~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~20260806095718~0.003~0.26~";
         v_sh516150="1~稀土ETF嘉实~516150~1.778~1.749~1.761~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~20260806100737~0.029~1.66~";
+        v_sh518880="1~黄金ETF~518880~6.321~6.246~6.250~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~20260806100737~0.075~1.20~";
         """
 
     def _ak(self):
@@ -320,6 +321,18 @@ class FastEastmoneyProvider(EastmoneyFallbackProvider):
 class EmptyEastmoneyProvider(TestableProvider):
     def _fetch_eastmoney_holdings_html(self, code):
         return "var apidata={ content:\"<table><tbody></tbody></table>\",arryear:[],curyear:2026};"
+
+
+class EastmoneyBondHoldingsProvider(TestableProvider):
+    def _fetch_eastmoney_bond_holdings_html(self, code):
+        return """
+        var apidata={ content:"<table><thead><tr>
+        <th>序号</th><th>债券代码</th><th>债券名称</th><th>占净值比例</th><th>持仓市值</th>
+        </tr></thead><tbody>
+        <tr><td>1</td><td>113052</td><td class='tol'>兴业转债</td><td class='tor'>14.27%</td><td></td></tr>
+        <tr><td>2</td><td>123107</td><td class='tol'>温氏转债</td><td class='tor'>9.05%</td><td></td></tr>
+        </tbody></table>",arryear:[2026],curyear:2026};
+        """
 
 
 class NoEastmoneyProvider(TestableProvider):
@@ -410,6 +423,16 @@ class AkshareProviderTests(unittest.TestCase):
         self.assertEqual(holdings[0].name, "闪迪")
         self.assertAlmostEqual(holdings[0].weight_pct, 10.1)
 
+    def test_bond_holdings_parse_eastmoney_zqcc_table(self):
+        provider = EastmoneyBondHoldingsProvider(FailingHoldingsAk())
+
+        holdings = provider.get_bond_holdings("005273")
+
+        self.assertEqual(len(holdings), 2)
+        self.assertEqual(holdings[0].code, "113052")
+        self.assertEqual(holdings[0].name, "兴业转债")
+        self.assertAlmostEqual(holdings[0].weight_pct, 14.27)
+
     def test_quotes_include_a_share_and_hk_holdings(self):
         provider = TestableProvider(FakeQuoteAk())
 
@@ -434,6 +457,13 @@ class AkshareProviderTests(unittest.TestCase):
         self.assertAlmostEqual(quotes["SNDK"].change_pct, 25.99)
         self.assertAlmostEqual(quotes["920368"].change_pct, -0.57)
 
+    def test_bond_quote_misses_do_not_trigger_full_market_stock_fallback(self):
+        provider = TencentQuoteProvider()
+
+        quotes = provider.get_quotes(["019829", "102318", "260203"])
+
+        self.assertEqual(quotes, {})
+
     def test_historical_quotes_calculate_interval_returns_by_market(self):
         provider = TestableProvider(FakeHistoricalQuoteAk())
 
@@ -450,6 +480,12 @@ class AkshareProviderTests(unittest.TestCase):
 
     def test_tencent_symbol_supports_beijing_exchange_codes(self):
         self.assertEqual(_tencent_symbol("920368"), "bj920368")
+
+    def test_tencent_symbol_supports_convertible_bond_codes(self):
+        self.assertEqual(_tencent_symbol("113052"), "sh113052")
+        self.assertEqual(_tencent_symbol("118058"), "sh118058")
+        self.assertEqual(_tencent_symbol("123107"), "sz123107")
+        self.assertEqual(_tencent_symbol("127084"), "sz127084")
 
     def test_official_estimate_includes_source_trade_date(self):
         provider = TestableProvider(FakeEstimateAk())
@@ -515,6 +551,7 @@ class AkshareProviderTests(unittest.TestCase):
         bank_quote = provider.get_tracking_index_quote("001595", fund_name="天弘中证银行ETF联接C")
         defense_quote = provider.get_tracking_index_quote("005693", fund_name="广发中证军工ETF联接C")
         rare_earth_quote = provider.get_tracking_index_quote("011036", fund_name="嘉实中证稀土产业ETF联接C")
+        gold_quote = provider.get_tracking_index_quote("000216", fund_name="华安黄金ETF联接C")
 
         self.assertIsNotNone(bank_quote)
         self.assertEqual(bank_quote.code, "515290")
@@ -531,9 +568,14 @@ class AkshareProviderTests(unittest.TestCase):
         self.assertEqual(rare_earth_quote.name, "稀土ETF嘉实")
         self.assertAlmostEqual(rare_earth_quote.change_pct, 1.66)
         self.assertEqual(rare_earth_quote.trade_date, "2026-08-06")
+        self.assertIsNotNone(gold_quote)
+        self.assertEqual(gold_quote.code, "518880")
+        self.assertEqual(gold_quote.name, "黄金ETF")
+        self.assertAlmostEqual(gold_quote.change_pct, 1.2)
         self.assertIn("sh515290", provider.queries[0])
         self.assertIn("sh512680", provider.queries[1])
         self.assertIn("sh516150", provider.queries[2])
+        self.assertIn("sh518880", provider.queries[3])
 
     def test_tracking_index_quote_maps_photovoltaic_index_fund(self):
         provider = TestableProvider(FakeTrackingIndexAk())

@@ -563,6 +563,9 @@ function sourceLabel(item) {
     holding: "持仓估算",
     factor_fit: "指数拟合",
     qdii_benchmark: "海外基准",
+    money_market: "货币收益",
+    tracking_proxy: "代理估值",
+    nav_only: "净值型",
     snapshot: "快照",
   };
   return labels[item.source] || item.source || item.status || "";
@@ -573,6 +576,10 @@ function estimateExplanationItems(item) {
     { text: snapshotQualityLabel(item), className: "snapshot-quality-note" },
     { text: estimateRiskLabel(item), className: "risk-note" },
     { text: qdiiBenchmarkLabel(item), className: "" },
+    { text: moneyMarketLabel(item), className: "" },
+    { text: trackingProxyLabel(item), className: "" },
+    { text: navOnlyLabel(item), className: "" },
+    { text: stableBondLabel(item), className: "" },
     { text: factorFitLabel(item), className: "" },
     { text: styleDriftLabel(item), className: "" },
   ].filter((note) => note.text);
@@ -601,6 +608,42 @@ function qdiiBenchmarkLabel(item) {
     parts.push(`汇率 ${formatPercent(item.fx_growth_pct)}`);
   }
   return parts.length ? `${name} / ${parts.join(" / ")}` : name;
+}
+
+function trackingProxyLabel(item) {
+  if (item.source !== "tracking_proxy") {
+    return null;
+  }
+  const name = item.proxy_name || item.proxy_code || "代理标的";
+  return `代理 ${name} ${formatPercent(item.estimate_growth_pct)}`;
+}
+
+function navOnlyLabel(item) {
+  if (item.source !== "nav_only") {
+    return null;
+  }
+  return "等待正式净值";
+}
+
+function moneyMarketLabel(item) {
+  if (item.source !== "money_market") {
+    return null;
+  }
+  const parts = [];
+  if (typeof item.money_market_income_per_10k === "number") {
+    parts.push(`万份收益 ${item.money_market_income_per_10k.toFixed(4)}`);
+  }
+  if (typeof item.money_market_seven_day_annualized_pct === "number") {
+    parts.push(`七日年化 ${formatPercent(item.money_market_seven_day_annualized_pct)}`);
+  }
+  return parts.length ? parts.join(" / ") : "货币基金收益";
+}
+
+function stableBondLabel(item) {
+  if (typeof item.stable_bond_weight_pct !== "number" || item.stable_bond_weight_pct <= 0) {
+    return null;
+  }
+  return `普通债券按0%日内变动 ${formatPercent(item.stable_bond_weight_pct)}`;
 }
 
 function factorFitLabel(item) {

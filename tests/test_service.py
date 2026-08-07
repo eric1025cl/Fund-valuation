@@ -56,6 +56,113 @@ class FakeProvider:
         return {"fake": "ok"}
 
 
+class ConvertibleBondFundProvider(FakeProvider):
+    def get_fund_name(self, code):
+        return "华商可转债债券A"
+
+    def get_latest_nav(self, code):
+        return LatestNav(nav=2.63, date="2026-08-06")
+
+    def get_holdings(self, code):
+        return [
+            Holding(name="精测电子", code="300567", weight_pct=10.0),
+            Holding(name="长川科技", code="300604", weight_pct=8.0),
+        ]
+
+    def get_bond_holdings(self, code):
+        return [
+            Holding(name="兴业转债", code="113052", weight_pct=14.27),
+            Holding(name="温氏转债", code="123107", weight_pct=9.05),
+            Holding(name="南航转债", code="110075", weight_pct=7.22),
+        ]
+
+    def get_quotes(self, stock_codes):
+        return {
+            "300567": Quote(code="300567", name="精测电子", change_pct=6.0),
+            "300604": Quote(code="300604", name="长川科技", change_pct=2.0),
+            "113052": Quote(code="113052", name="兴业转债", change_pct=-0.25),
+            "123107": Quote(code="123107", name="温氏转债", change_pct=-0.60),
+            "110075": Quote(code="110075", name="南航转债", change_pct=0.04),
+        }
+
+
+class MoneyMarketProvider(FakeProvider):
+    def get_fund_name(self, code):
+        return "兴银现金添利A"
+
+    def get_latest_nav(self, code):
+        return None
+
+    def get_holdings(self, code):
+        return []
+
+    def get_quotes(self, stock_codes):
+        return {}
+
+    def get_money_market_snapshot(self, code):
+        return {
+            "date": "2026-08-06",
+            "income_per_10k": 0.3346,
+            "seven_day_annualized_pct": 1.318,
+        }
+
+
+class RegularBondFundProvider(FakeProvider):
+    def get_fund_name(self, code):
+        return "工银瑞信添慧债券A"
+
+    def get_holdings(self, code):
+        return [
+            Holding(name="紫金矿业", code="601899", weight_pct=12.0),
+            Holding(name="东方钽业", code="000962", weight_pct=8.0),
+        ]
+
+    def get_bond_holdings(self, code):
+        return [
+            Holding(name="26国债03", code="019829", weight_pct=25.0),
+            Holding(name="26国开03", code="260203", weight_pct=20.0),
+        ]
+
+    def get_quotes(self, stock_codes):
+        return {
+            "601899": Quote(code="601899", name="紫金矿业", change_pct=2.0),
+            "000962": Quote(code="000962", name="东方钽业", change_pct=2.0),
+        }
+
+
+class ProxyOnlyFundProvider(FakeProvider):
+    def get_fund_name(self, code):
+        return "华安黄金ETF联接C"
+
+    def get_holdings(self, code):
+        return []
+
+    def get_quotes(self, stock_codes):
+        return {}
+
+    def get_tracking_index_quote(self, code, fund_name=None):
+        return Quote(code="518880", name="华安黄金ETF", change_pct=1.2, trade_date="2026-07-31")
+
+
+class FofFundProvider(FakeProvider):
+    def get_fund_name(self, code):
+        return "养老目标日期2035三年持有混合(FOF)A"
+
+    def get_latest_nav(self, code):
+        return LatestNav(nav=1.2345, date="2026-07-30")
+
+    def get_holdings(self, code):
+        return []
+
+    def get_quotes(self, stock_codes):
+        return {}
+
+
+class ReitFundProvider(FofFundProvider):
+    def get_fund_name(self, code):
+        return "中金厦门安居保障性租赁住房封闭式基础设施证券投资基金REIT"
+
+
 class BasicInfoOnlyProvider(FakeProvider):
     def __init__(self):
         super().__init__()
@@ -880,6 +987,87 @@ class FundValuationServiceTests(unittest.TestCase):
         self.assertAlmostEqual(result["estimate_nav"], 1.015, places=3)
         self.assertAlmostEqual(result["fit_r2"], 1.0, places=3)
         self.assertIn("factor_exposures", result)
+
+    def test_low_stock_coverage_uses_bond_holdings_when_available(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=ConvertibleBondFundProvider())
+
+            result = service.estimate_fund("005273", now=TRADING_TIME)
+
+        self.assertEqual(result["status"], "estimated")
+        self.assertEqual(result["source"], "holding")
+        self.assertAlmostEqual(result["coverage_pct"], 48.54)
+        self.assertAlmostEqual(result["estimate_growth_pct"], 1.3863, places=4)
+        self.assertAlmostEqual(result["estimate_nav"], 2.66646, places=6)
+
+    def test_regular_bond_fund_treats_unquoted_bond_holdings_as_stable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=RegularBondFundProvider())
+
+            result = service.estimate_fund("006738", now=TRADING_TIME)
+
+        self.assertEqual(result["status"], "estimated")
+        self.assertEqual(result["source"], "holding")
+        self.assertAlmostEqual(result["coverage_pct"], 65.0)
+        self.assertAlmostEqual(result["stable_bond_weight_pct"], 45.0)
+        self.assertAlmostEqual(result["estimate_growth_pct"], 0.6154, places=4)
+        self.assertAlmostEqual(result["estimate_nav"], 1.006154, places=6)
+
+    def test_money_market_fund_uses_published_income_when_nav_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=MoneyMarketProvider())
+
+            result = service.estimate_fund("004121", now=datetime(2026, 8, 7, 10, 0, 0))
+
+        self.assertEqual(result["status"], "estimated")
+        self.assertEqual(result["source"], "money_market")
+        self.assertAlmostEqual(result["estimate_nav"], 1.000033)
+        self.assertAlmostEqual(result["estimate_growth_pct"], 0.0033)
+        self.assertAlmostEqual(result["money_market_income_per_10k"], 0.3346)
+        self.assertAlmostEqual(result["money_market_seven_day_annualized_pct"], 1.318)
+        self.assertEqual(result["trade_date"], "2026-08-06")
+
+    def test_proxy_only_fund_uses_tracking_quote_when_holdings_are_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=ProxyOnlyFundProvider())
+
+            result = service.estimate_fund("000216", now=TRADING_TIME)
+
+        self.assertEqual(result["status"], "estimated")
+        self.assertEqual(result["source"], "tracking_proxy")
+        self.assertEqual(result["fund_type"], "commodity")
+        self.assertEqual(result["proxy_code"], "518880")
+        self.assertAlmostEqual(result["estimate_nav"], 1.012)
+        self.assertAlmostEqual(result["estimate_growth_pct"], 1.2)
+
+    def test_fof_fund_returns_nav_only_explanation_instead_of_empty_holding(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=FofFundProvider())
+
+            result = service.estimate_fund("012345", now=TRADING_TIME)
+
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["source"], "nav_only")
+        self.assertEqual(result["fund_type"], "fof")
+        self.assertEqual(result["reason"], "nav_only_fund_type")
+        self.assertAlmostEqual(result["latest_nav"], 1.2345)
+
+    def test_reit_fund_returns_nav_only_explanation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WatchlistStore(Path(temp_dir) / "funds.db")
+            service = FundValuationService(store=store, provider=ReitFundProvider())
+
+            result = service.estimate_fund("508000", now=TRADING_TIME)
+
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["source"], "nav_only")
+        self.assertEqual(result["fund_type"], "reit")
+        self.assertEqual(result["reason"], "nav_only_fund_type")
 
     def test_holding_estimate_blends_uncovered_weight_with_factor_fit(self):
         class FactorBlendProvider(FakeProvider):

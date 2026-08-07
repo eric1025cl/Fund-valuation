@@ -207,6 +207,7 @@ class FundValuationService:
             "name": fund.name or f"鍩洪噾{fund.code}",
             "status": "unavailable",
             "source": "refresh",
+            "fund_type": _fund_type(fund.name or ""),
             "estimate_nav": None,
             "estimate_growth_pct": None,
             "coverage_pct": 0.0,
@@ -300,6 +301,7 @@ class FundValuationService:
                 "name": name or f"基金{fund_code}",
                 "status": "estimated",
                 "source": "official",
+                "fund_type": _fund_type(name or ""),
                 "estimate_nav": round(float(official.nav), 6),
                 "estimate_growth_pct": round(float(official.growth_pct), 4),
                 "coverage_pct": 100.0,
@@ -322,6 +324,25 @@ class FundValuationService:
             )
             return self._with_calibrated_confidence(fund_code, result)
 
+        money_market_result = self._money_market_estimate(
+            fund_code,
+            name or "",
+            context,
+            target_trade_date,
+        )
+        if money_market_result is not None:
+            return money_market_result
+
+        nav_only_result = self._nav_only_estimate(
+            fund_code,
+            name or "",
+            latest_nav,
+            context,
+            target_trade_date,
+        )
+        if nav_only_result is not None:
+            return nav_only_result
+
         qdii_benchmark_result = self._qdii_benchmark_estimate(
             fund_code,
             name or "",
@@ -340,14 +361,35 @@ class FundValuationService:
             quotes=quotes,
             min_coverage_pct=self._coverage_floor(name or ""),
         ).to_dict()
+        result = self._with_bond_holdings_if_useful(
+            fund_code,
+            name or "",
+            latest_nav,
+            target_trade_date,
+            holdings,
+            result,
+        )
         factor_result = self._factor_fit_estimate(fund_code, latest_nav) if include_factor_monitoring else None
         tracking_quote = self._tracking_index_quote(fund_code, name or "")
+        if result.get("status") != "estimated":
+            proxy_result = self._tracking_proxy_estimate(
+                fund_code,
+                name or "",
+                latest_nav,
+                tracking_quote,
+                context,
+                target_trade_date,
+            )
+            if proxy_result is not None:
+                return self._with_calibrated_confidence(fund_code, proxy_result)
+
         if result.get("status") != "estimated" and factor_result is not None and factor_result.status == "estimated":
             factor_data = factor_result.to_dict()
             factor_data.update(
                 {
                     "code": fund_code,
                     "name": name or f"基金{fund_code}",
+                    "fund_type": _fund_type(name or ""),
                     "estimate_time": None,
                     "holding_reason": result.get("reason"),
                     "holding_coverage_pct": result.get("coverage_pct"),
@@ -367,6 +409,7 @@ class FundValuationService:
             {
                 "code": fund_code,
                 "name": name or f"基金{fund_code}",
+                "fund_type": _fund_type(name or ""),
                 "estimate_time": None,
             }
         )
@@ -377,6 +420,117 @@ class FundValuationService:
             holding_trade_date = target_trade_date
         self._attach_valuation_context(result, context, trade_date=holding_trade_date or target_trade_date)
         return self._with_calibrated_confidence(fund_code, result)
+
+    def _with_bond_holdings_if_useful(
+        self,
+        fund_code: str,
+        fund_name: str,
+        latest_nav: LatestNav | None,
+        target_trade_date: str,
+        holdings: list[Holding],
+        result: dict,
+    ) -> dict:
+        if result.get("status") == "estimated":
+            return result
+        get_bond_holdings = getattr(self.provider, "get_bond_holdings", None)
+        if not callable(get_bond_holdings):
+            return result
+        bond_holdings = self._safe_call(lambda: get_bond_holdings(fund_code)) or []
+        combined = _merge_holdings(holdings, bond_holdings)
+        if len(combined) <= len(holdings):
+            return result
+        combined_quotes = self._holding_quotes(fund_name, combined, latest_nav, target_trade_date)
+        stable_bond_weight = _add_stable_bond_quotes(combined_quotes, bond_holdings)
+        combined_result = calculate_holding_estimate(
+            latest_nav=latest_nav,
+            holdings=combined,
+            quotes=combined_quotes,
+            min_coverage_pct=self._coverage_floor(fund_name),
+        ).to_dict()
+        if _estimate_rank(combined_result) < _estimate_rank(result):
+            return result
+        combined_result["included_bond_holdings"] = True
+        if stable_bond_weight > 0:
+            combined_result["stable_bond_weight_pct"] = round(stable_bond_weight, 4)
+        return combined_result
+
+    def _money_market_estimate(
+        self,
+        fund_code: str,
+        fund_name: str,
+        context: dict,
+        target_trade_date: str,
+    ) -> dict | None:
+        get_snapshot = getattr(self.provider, "get_money_market_snapshot", None)
+        if not callable(get_snapshot):
+            return None
+        snapshot = self._safe_call(lambda: get_snapshot(fund_code))
+        if not isinstance(snapshot, dict):
+            return None
+        income = _number_or_none(snapshot.get("income_per_10k"))
+        annualized = _number_or_none(snapshot.get("seven_day_annualized_pct"))
+        if income is None and annualized is None:
+            return None
+        daily_growth_pct = income / 100.0 if income is not None else annualized / 365.0
+        estimate_nav = 1.0 * (1 + daily_growth_pct / 100.0)
+        result = {
+            "code": fund_code,
+            "name": fund_name or f"基金{fund_code}",
+            "status": "estimated",
+            "source": "money_market",
+            "fund_type": "money_market",
+            "estimate_nav": round(estimate_nav, 6),
+            "estimate_growth_pct": round(daily_growth_pct, 4),
+            "coverage_pct": 100.0,
+            "confidence": 100.0,
+            "reason": None,
+            "latest_nav": 1.0,
+            "latest_nav_date": _date_key(snapshot.get("date")) or None,
+            "estimate_time": None,
+            "contributions": [],
+            "money_market_income_per_10k": round(income, 4) if income is not None else None,
+            "money_market_seven_day_annualized_pct": round(annualized, 4) if annualized is not None else None,
+        }
+        self._attach_valuation_context(
+            result,
+            context,
+            trade_date=_date_key(snapshot.get("date")) or target_trade_date,
+        )
+        return result
+
+    def _nav_only_estimate(
+        self,
+        fund_code: str,
+        fund_name: str,
+        latest_nav: LatestNav | None,
+        context: dict,
+        target_trade_date: str,
+    ) -> dict | None:
+        fund_type = _fund_type(fund_name)
+        if fund_type not in {"fof", "reit"}:
+            return None
+        result = {
+            "code": fund_code,
+            "name": fund_name or f"基金{fund_code}",
+            "status": "unavailable",
+            "source": "nav_only",
+            "fund_type": fund_type,
+            "estimate_nav": None,
+            "estimate_growth_pct": None,
+            "coverage_pct": 0.0,
+            "confidence": 0.0,
+            "reason": "nav_only_fund_type",
+            "latest_nav": round(float(latest_nav.nav), 6) if latest_nav is not None else None,
+            "latest_nav_date": latest_nav.date if latest_nav is not None else None,
+            "estimate_time": None,
+            "contributions": [],
+        }
+        self._attach_valuation_context(
+            result,
+            context,
+            trade_date=_date_key(latest_nav.date) if latest_nav is not None else target_trade_date,
+        )
+        return result
 
     def _holding_quotes(
         self,
@@ -533,6 +687,7 @@ class FundValuationService:
             "name": fund_name or f"基金{fund_code}",
             "status": "estimated",
             "source": "nav",
+            "fund_type": _fund_type(fund_name),
             "estimate_nav": round(float(target_nav.nav), 6),
             "estimate_growth_pct": round(growth_pct, 4) if growth_pct is not None else None,
             "coverage_pct": 100.0,
@@ -573,6 +728,45 @@ class FundValuationService:
             return None
         return self._safe_call(lambda: get_tracking_index_quote(fund_code, fund_name=fund_name))
 
+    def _tracking_proxy_estimate(
+        self,
+        fund_code: str,
+        fund_name: str,
+        latest_nav: LatestNav | None,
+        tracking_quote: Quote | None,
+        context: dict,
+        target_trade_date: str,
+    ) -> dict | None:
+        growth = _number_or_none(getattr(tracking_quote, "change_pct", None))
+        if latest_nav is None or latest_nav.nav <= 0 or growth is None:
+            return None
+        estimate_nav = float(latest_nav.nav) * (1 + growth / 100.0)
+        result = {
+            "code": fund_code,
+            "name": fund_name or f"基金{fund_code}",
+            "status": "estimated",
+            "source": "tracking_proxy",
+            "fund_type": _fund_type(fund_name),
+            "estimate_nav": round(estimate_nav, 6),
+            "estimate_growth_pct": round(growth, 4),
+            "coverage_pct": 100.0,
+            "confidence": 80.0,
+            "reason": None,
+            "latest_nav": round(float(latest_nav.nav), 6),
+            "latest_nav_date": latest_nav.date,
+            "estimate_time": getattr(tracking_quote, "quote_time", None),
+            "contributions": [],
+            "proxy_code": getattr(tracking_quote, "code", None),
+            "proxy_name": getattr(tracking_quote, "name", None),
+            "proxy_source": _tracking_proxy_source(tracking_quote),
+        }
+        self._attach_valuation_context(
+            result,
+            context,
+            trade_date=_date_key(getattr(tracking_quote, "trade_date", None)) or target_trade_date,
+        )
+        return result
+
     def _qdii_benchmark_estimate(
         self,
         fund_code: str,
@@ -609,6 +803,7 @@ class FundValuationService:
             "name": fund_name or f"基金{fund_code}",
             "status": "estimated",
             "source": "qdii_benchmark",
+            "fund_type": "qdii",
             "estimate_nav": round(float(latest_nav.nav) * (1 + growth_pct / 100.0), 6),
             "estimate_growth_pct": round(growth_pct, 4),
             "coverage_pct": 100.0,
@@ -1015,6 +1210,7 @@ class FundValuationService:
         result["code"] = fund.code
         result["alias"] = fund.alias
         result["name"] = result.get("name") or fund.name or f"基金{fund.code}"
+        result["fund_type"] = result.get("fund_type") or _fund_type(result["name"])
         result["snapshot_key"] = snapshot_key
         result["snapshot_date"] = context["trade_date"]
         result["trade_date"] = _date_key(result.get("trade_date")) or context["trade_date"]
@@ -1031,6 +1227,7 @@ class FundValuationService:
             "name": fund.name or f"基金{fund.code}",
             "status": "unavailable",
             "source": "snapshot",
+            "fund_type": _fund_type(fund.name or ""),
             "estimate_nav": None,
             "estimate_growth_pct": None,
             "coverage_pct": 0.0,
@@ -1140,6 +1337,79 @@ def _quote_trade_date(quotes: dict[str, Quote]) -> str:
     return max(counts.items(), key=lambda item: (item[1], item[0]))[0]
 
 
+def _merge_holdings(*groups: list[Holding]) -> list[Holding]:
+    merged: dict[str, Holding] = {}
+    order: list[str] = []
+    for holdings in groups:
+        for holding in holdings or []:
+            code = _normalize_holding_code(holding.code)
+            if not code:
+                continue
+            if code not in merged:
+                order.append(code)
+                merged[code] = Holding(
+                    name=holding.name,
+                    code=code,
+                    weight_pct=max(float(holding.weight_pct or 0.0), 0.0),
+                )
+            else:
+                existing = merged[code]
+                merged[code] = Holding(
+                    name=existing.name or holding.name,
+                    code=code,
+                    weight_pct=max(existing.weight_pct, float(holding.weight_pct or 0.0)),
+                )
+    return [merged[code] for code in order]
+
+
+def _normalize_holding_code(code: str) -> str:
+    text = str(code or "").strip().upper()
+    return text[-6:] if text.isdigit() and len(text) >= 6 else text
+
+
+def _estimate_rank(result: dict) -> tuple[int, float]:
+    status_rank = 1 if result.get("status") == "estimated" else 0
+    coverage = _number_or_none(result.get("coverage_pct")) or 0.0
+    return status_rank, coverage
+
+
+def _add_stable_bond_quotes(quotes: dict[str, Quote], bond_holdings: list[Holding]) -> float:
+    stable_weight = 0.0
+    for holding in bond_holdings or []:
+        code = _normalize_holding_code(holding.code)
+        if not code or code in quotes or not _is_stable_bond_holding(holding):
+            continue
+        quotes[code] = Quote(
+            code=code,
+            name=holding.name or code,
+            change_pct=0.0,
+        )
+        stable_weight += max(float(holding.weight_pct or 0.0), 0.0)
+    return stable_weight
+
+
+def _is_stable_bond_holding(holding: Holding) -> bool:
+    name = str(holding.name or "")
+    code = str(holding.code or "").strip()
+    if "转债" in name or "转2" in name or "转02" in name:
+        return False
+    if code.startswith(("019", "102", "260")) or len(code) > 6:
+        return True
+    return any(
+        marker in name
+        for marker in (
+            "国债",
+            "国开",
+            "地方债",
+            "金融债",
+            "资本债",
+            "农发",
+            "进出",
+            "银行",
+        )
+    )
+
+
 def _is_qdii_name(fund_name: str) -> bool:
     return "QDII" in str(fund_name or "").upper()
 
@@ -1150,6 +1420,32 @@ def _is_index_like_name(fund_name: str) -> bool:
     return any(marker in text for marker in ("指数", "指數", "联接", "聯接")) or any(
         marker in upper for marker in ("ETF", "LOF")
     )
+
+
+def _fund_type(fund_name: str) -> str:
+    text = str(fund_name or "")
+    upper = text.upper()
+    if "FOF" in upper:
+        return "fof"
+    if "REIT" in upper or "基础设施" in text:
+        return "reit"
+    if "货币" in text or "现金" in text:
+        return "money_market"
+    if "可转债" in text or "可轉債" in text:
+        return "convertible_bond"
+    if any(marker in text for marker in ("黄金", "商品", "原油", "有色")):
+        return "commodity"
+    if _is_qdii_name(text):
+        return "qdii"
+    if "ETF联接" in text or "ETF聯接" in text:
+        return "etf_link"
+    if _is_index_like_name(text):
+        return "index"
+    if any(marker in text for marker in ("同业存单", "短债", "纯债", "债券", "债")):
+        return "regular_bond"
+    if "混合" in text or "股票" in text:
+        return "equity"
+    return "unknown"
 
 
 def _holding_momentum_proxy_growth(

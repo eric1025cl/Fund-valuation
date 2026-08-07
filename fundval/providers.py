@@ -36,6 +36,7 @@ TARGET_ETF_BY_FUND_NAME = (
     ("天弘中证银行ETF联接", "515290", "天弘中证银行ETF"),
     ("广发中证军工ETF联接", "512680", "广发中证军工ETF"),
     ("嘉实中证稀土产业ETF联接", "516150", "嘉实中证稀土产业ETF"),
+    ("黄金ETF联接", "518880", "华安黄金ETF"),
 )
 QDII_BENCHMARK_BY_FUND_CODE = {
     "539001": {
@@ -183,6 +184,24 @@ class AkshareProvider:
             current_day_only=True,
         ) or []
 
+    def get_bond_holdings(self, code: str) -> list[Holding]:
+        return self._cached(
+            f"bond_holdings:{code}",
+            lambda current=code: self._get_eastmoney_bond_holdings(current),
+            STATIC_DAY_CACHE_TTL,
+            current_day_only=True,
+        ) or []
+
+    def get_money_market_snapshot(self, code: str) -> dict | None:
+        return self._cached(
+            f"money_market_snapshot:{code}",
+            lambda current=code: _money_market_snapshot_from_text(
+                self._fetch_eastmoney_nav_text(current)
+            ),
+            PUBLISHED_NAV_CACHE_TTL,
+            current_day_only=True,
+        )
+
     def _fetch_holdings(self, code: str) -> list[Holding]:
         ak = self._ak()
         current_year = datetime.now().year
@@ -234,45 +253,24 @@ class AkshareProvider:
 
     def _get_eastmoney_holdings(self, code: str) -> list[Holding]:
         text = self._fetch_eastmoney_holdings_html(code)
-        if not text:
-            return []
-        content = _extract_apidata_content(text)
-        try:
-            from bs4 import BeautifulSoup
-        except Exception:
-            return []
-        soup = BeautifulSoup(content, "html.parser")
-        table = soup.find("table")
-        if table is None:
-            return []
-        headers = [_compact_text(cell.get_text("", strip=True)) for cell in table.find_all("th")]
-        code_index = _find_header_index(headers, "股票代码", 1)
-        name_index = _find_header_index(headers, "股票名称", 2)
-        weight_index = _find_header_index(headers, "占净值", 4)
-        holdings: list[Holding] = []
-        for row in table.select("tbody tr"):
-            cells = row.find_all("td")
-            if len(cells) <= max(code_index, name_index, weight_index):
-                continue
-            stock_code = _normalize_stock_code(cells[code_index].get_text("", strip=True))
-            name = cells[name_index].get_text("", strip=True)
-            weight = _parse_float(cells[weight_index].get_text("", strip=True))
-            if stock_code and name and weight is not None:
-                holdings.append(Holding(name=name, code=stock_code, weight_pct=weight))
-        return holdings[:10]
+        return _holdings_from_eastmoney_archive(text, code_marker="股票代码", name_marker="股票名称")
 
-    def _try_eastmoney_holdings(self, code: str) -> tuple[bool, list[Holding]]:
-        try:
-            return True, self._get_eastmoney_holdings(code)
-        except Exception:
-            return False, []
+    def _get_eastmoney_bond_holdings(self, code: str) -> list[Holding]:
+        text = self._fetch_eastmoney_bond_holdings_html(code)
+        return _holdings_from_eastmoney_archive(text, code_marker="债券代码", name_marker="债券名称")
 
     def _fetch_eastmoney_holdings_html(self, code: str) -> str:
+        return self._fetch_eastmoney_archive_html(code, "jjcc")
+
+    def _fetch_eastmoney_bond_holdings_html(self, code: str) -> str:
+        return self._fetch_eastmoney_archive_html(code, "zqcc")
+
+    def _fetch_eastmoney_archive_html(self, code: str, archive_type: str) -> str:
         import requests
 
         url = (
             "https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
-            f"?type=jjcc&code={code}&topline=10&year=&month=&rt={datetime.now().timestamp()}"
+            f"?type={archive_type}&code={code}&topline=10&year=&month=&rt={datetime.now().timestamp()}"
         )
         response = requests.get(
             url,
@@ -285,6 +283,12 @@ class AkshareProvider:
         response.raise_for_status()
         return response.text
 
+    def _try_eastmoney_holdings(self, code: str) -> tuple[bool, list[Holding]]:
+        try:
+            return True, self._get_eastmoney_holdings(code)
+        except Exception:
+            return False, []
+
     def get_quotes(self, stock_codes: list[str]) -> dict[str, Quote]:
         codes = {_normalize_stock_code(code) for code in stock_codes if code}
         if not codes:
@@ -292,6 +296,9 @@ class AkshareProvider:
         result = self._get_tencent_quotes(codes)
         missing_codes = codes - set(result)
         if not missing_codes:
+            return result
+        fallback_codes = {code for code in missing_codes if _uses_full_market_quote_fallback(code)}
+        if not fallback_codes:
             return result
         ak = self._ak()
         for loader in (ak.stock_zh_a_spot_em, getattr(ak, "stock_hk_spot_em", None)):
@@ -301,9 +308,9 @@ class AkshareProvider:
                 df = loader()
             except Exception:
                 continue
-            result.update(_quotes_from_dataframe(df, missing_codes))
-            missing_codes = codes - set(result)
-            if not missing_codes:
+            result.update(_quotes_from_dataframe(df, fallback_codes))
+            fallback_codes -= set(result)
+            if not fallback_codes:
                 break
         return result
 
@@ -796,6 +803,30 @@ def _quotes_from_dataframe(df, target_codes: set[str]) -> dict[str, Quote]:
     return result
 
 
+def _uses_full_market_quote_fallback(code: str) -> bool:
+    normalized = _normalize_stock_code(code)
+    if any(ch.isalpha() for ch in normalized):
+        return False
+    if len(normalized) == 5:
+        return True
+    return normalized.startswith(
+        (
+            "000",
+            "001",
+            "002",
+            "003",
+            "300",
+            "301",
+            "600",
+            "601",
+            "603",
+            "605",
+            "688",
+            "689",
+        )
+    )
+
+
 def _tracking_index_for_fund(code: str, fund_name: str | None) -> tuple[str, str] | None:
     fund_code = _normalize_stock_code(code)
     if fund_code in TRACKING_INDEX_BY_FUND_CODE:
@@ -973,6 +1004,10 @@ def _tencent_symbol(code: str) -> str:
         return f"hk{normalized}"
     if normalized.startswith(("4", "8", "920")):
         return f"bj{normalized}"
+    if normalized.startswith(("110", "111", "113", "118")):
+        return f"sh{normalized}"
+    if normalized.startswith(("123", "127", "128")):
+        return f"sz{normalized}"
     if normalized.startswith(("5", "6", "9")):
         return f"sh{normalized}"
     return f"sz{normalized}"
@@ -1027,6 +1062,82 @@ def _extract_apidata_content(text: str) -> str:
     content = match.group("content") if match else text
     content = content.replace(r"\/", "/").replace(r"\"", '"')
     return html.unescape(content)
+
+
+def _holdings_from_eastmoney_archive(
+    text: str,
+    code_marker: str,
+    name_marker: str,
+) -> list[Holding]:
+    if not text:
+        return []
+    content = _extract_apidata_content(text)
+    try:
+        from bs4 import BeautifulSoup
+    except Exception:
+        return []
+    soup = BeautifulSoup(content, "html.parser")
+    table = soup.find("table")
+    if table is None:
+        return []
+    headers = [_compact_text(cell.get_text("", strip=True)) for cell in table.find_all("th")]
+    code_index = _find_header_index(headers, code_marker, 1)
+    name_index = _find_header_index(headers, name_marker, 2)
+    weight_index = _find_header_index(headers, "占净值", 3 if code_marker == "债券代码" else 4)
+    holdings: list[Holding] = []
+    for row in table.select("tbody tr"):
+        cells = row.find_all("td")
+        if len(cells) <= max(code_index, name_index, weight_index):
+            continue
+        holding_code = _normalize_stock_code(cells[code_index].get_text("", strip=True))
+        name = cells[name_index].get_text("", strip=True)
+        weight = _parse_float(cells[weight_index].get_text("", strip=True))
+        if holding_code and name and weight is not None:
+            holdings.append(Holding(name=name, code=holding_code, weight_pct=weight))
+    return holdings
+
+
+def _money_market_snapshot_from_text(text: str) -> dict | None:
+    income_rows = _eastmoney_array_from_text(text, "Data_millionCopiesIncome")
+    annualized_rows = _eastmoney_array_from_text(text, "Data_sevenDaysYearIncome")
+    latest_income = _latest_pair(income_rows)
+    latest_annualized = _latest_pair(annualized_rows)
+    if latest_income is None and latest_annualized is None:
+        return None
+    date_key = ""
+    income_value = None
+    annualized_value = None
+    if latest_income is not None:
+        date_key = _eastmoney_timestamp_date(latest_income[0])
+        income_value = _parse_float(latest_income[1])
+    if latest_annualized is not None:
+        date_key = date_key or _eastmoney_timestamp_date(latest_annualized[0])
+        annualized_value = _parse_float(latest_annualized[1])
+    if income_value is None and annualized_value is None:
+        return None
+    return {
+        "date": date_key,
+        "income_per_10k": income_value,
+        "seven_day_annualized_pct": annualized_value,
+    }
+
+
+def _eastmoney_array_from_text(text: str, name: str) -> list:
+    match = re.search(rf"var\s+{re.escape(name)}\s*=\s*(?P<rows>\[.*?\]);", text or "", re.S)
+    if not match:
+        return []
+    try:
+        rows = json.loads(match.group("rows"))
+    except json.JSONDecodeError:
+        return []
+    return rows if isinstance(rows, list) else []
+
+
+def _latest_pair(rows: list):
+    for row in reversed(rows):
+        if isinstance(row, list) and len(row) >= 2:
+            return row
+    return None
 
 
 def _compact_text(text: str) -> str:
