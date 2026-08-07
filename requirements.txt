@@ -5,3 +5,5 @@ akshare
 pandas
 requests
 beautifulsoup4
+pywebview
+pyinstaller
