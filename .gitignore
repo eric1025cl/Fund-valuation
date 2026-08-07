@@ -5,3 +5,6 @@ __pycache__/
 data/
 logs/
 *.db
+build/
+dist/
+FundValuation.spec
