@@ -5,8 +5,8 @@ import sys
 import traceback
 from pathlib import Path
 
-from .runtime import configure_desktop_environment, find_free_port
-from .server import DesktopServer
+from desktop.runtime import configure_desktop_environment, find_free_port
+from desktop.server import DesktopServer
 
 
 WINDOW_TITLE = "Fund Valuation"
