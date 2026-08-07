@@ -11,6 +11,31 @@ python -m uvicorn app:app --reload --host 127.0.0.1 --port 8000
 
 浏览器打开 `http://127.0.0.1:8000`。
 
+## 桌面客户端
+
+桌面版是完全本地单机应用。启动后会在本机自动拉起内置 FastAPI 服务，并在桌面窗口中加载现有页面；自选基金、快照和对账数据仍保存在本机 SQLite。
+
+开发环境启动：
+
+```powershell
+python -m pip install -r requirements.txt
+python -m desktop
+```
+
+Windows 打包：
+
+```powershell
+.\desktop\build-windows.ps1
+```
+
+macOS 打包：
+
+```sh
+sh desktop/build-macos.sh
+```
+
+源码运行时默认使用 `data/funds.db`。打包后的 Windows 应用默认使用 `%LOCALAPPDATA%\FundValuation\data\funds.db`，macOS 应用默认使用 `~/Library/Application Support/FundValuation/data/funds.db`。可以通过 `FUNDVAL_DATA_DIR` 指定自定义数据目录。
+
 ## 测试
 
 ```powershell
